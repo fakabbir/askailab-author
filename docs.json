@@ -32,19 +32,6 @@
         ]
       },
       {
-        "tab": "Data Structures",
-        "pages": [
-          "index",
-          "quickstart",
-          "stack",
-          "segment-tree-in-python",
-          "searning-in-a-bst",
-          "fenwick-tree-and-segment-tree",
-          "quick-hard-concept-video-this",
-          "dynamic-programming-001"
-        ]
-      },
-      {
         "tab": "Forward Deployment Engineer",
         "pages": [
           "caching-llm-chats-to-quick-answer-user-query-without-rag",
