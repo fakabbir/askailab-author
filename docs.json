@@ -1,11 +1,11 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "sequoia",
-  "name": "Ask AI Labs",
+  "theme": "luma",
+  "name": "AskAILab",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#0f62fe",
+    "light": "#4589ff",
+    "dark": "#0043ce"
   },
   "favicon": "/favicon.svg",
   "navigation": {
@@ -57,17 +57,25 @@
     "light": "/logo/light.svg",
     "dark": "/logo/dark.svg"
   },
+  "fonts": {
+    "heading": {
+      "family": "IBM Plex Serif"
+    },
+    "body": {
+      "family": "IBM Plex Sans"
+    }
+  },
   "navbar": {
     "links": [
       {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
+        "label": "AskAILab",
+        "href": "https://askailab.com"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "label": "Contact",
+      "href": "https://askailab.com/#contact"
     }
   },
   "contextual": {
@@ -82,17 +90,13 @@
       "vscode"
     ]
   },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
-  },
   "icons": {
     "library": "lucide"
   },
   "background": {
-    "decoration": "windows"
+    "color": {
+      "light": "#ffffff",
+      "dark": "#161616"
+    }
   }
 }
