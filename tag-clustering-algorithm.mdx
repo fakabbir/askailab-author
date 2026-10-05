@@ -1,9 +1,128 @@
 ---
-title: "tag clustering algorithm"
+title: "Tag clustering algorithm"
+description: "How I cluster tags — why they behave nothing like numeric feature vectors, and how hierarchical, k-means, and graph-based methods each behave on tag data."
 ---
 
-**Common Algorithms Used**
+Tag clustering shows up whenever I have a long tail of user- or content-generated labels and I need to fold near-duplicates together, build a taxonomy, or collapse a sparse tag space into a smaller feature set. It looks like a solved "just call sklearn" problem until I feed it real tags, because tags break several assumptions that numeric feature vectors let me take for granted. This article is how I think about that, and a runnable example I keep for prototyping.
 
-- **Hierarchical/Agglomerative Clustering:** Merges tags into a tree of clusters; ideal when the total number of clusters is unknown.
-- **K-Means / Extended Vector Space Model:** Partitions tags into K predefined groups using numeric feature representations.
-- **Graph-Based & Neighborhood Methods:** Algorithms like KNN directed graphs, Affinity Propagation, or Local Information Passing Clustering (LIPC) connect related tags by local density
+## Why tags are not ordinary feature vectors
+
+A tag is a short label ("beach", "family beach trip"), not a row of measurements. Three properties change how clustering behaves.
+
+**Sparsity.** Each tag string populates a tiny number of features. If I represent the vocabulary as one-hot or bag-of-tokens over 50,000 distinct words, a tag like "spa retreat" lights up 2 of 50,000 dimensions. Euclidean distance in that space is dominated by which words happen to be absent, and two tags about the same thing with different words land far apart. This is why I almost always embed first and cluster on the embedding.
+
+**High cardinality.** There are vastly more distinct tags than there are meaningful groups. A travel platform might carry hundreds of thousands of distinct tags collapsing into a few hundred real concepts. Clustering has to tolerate a very long tail of one-offs without inventing a cluster per typo.
+
+**Co-occurrence structure.** The signal in tags is not the spelling of a single tag, it is *which tags appear together* on the same item or user. "beach" and "sunbathing" cluster because the same listings carry both, even though they share zero characters or tokens. This is the property that graph and embedding methods exploit and that pure string distance misses completely.
+
+To cluster, I need vectors. The cheap option is feature hashing: token (or character n-gram) → bucket in a fixed-width vector, then cosine similarity. The better option in production is a learned embedding — a co-occurrence matrix (PMI-weighted) or a tag2vec / sentence-transformer embedding — so that "wine tasting" and "winery tour" sit near each other even with no shared token. My toy example below uses hashed token vectors so it runs anywhere; the clustering code is identical if you swap in real embeddings.
+
+## How each algorithm behaves on tag data
+
+### Hierarchical / agglomerative clustering
+
+This merges tags bottom-up into a tree (dendrogram): every tag starts as its own cluster, and at each step the two closest clusters merge under a linkage rule — single, complete, average, or Ward. It is **ideal when the total number of clusters is unknown**, because I do not pick K: I cut the dendrogram at a distance threshold or at a desired granularity, and read off the groups. On tags this is my default, because I can eyeball the merge order and stop when it starts gluing unrelated concepts. Average-linkage is the sane middle ground; single-linkage suffers the chain effect where "food tour" links "wine tasting" through an overlapping bridge tag, and complete-linkage fragments legitimate clusters. Complexity is roughly `O(n^2)` in tags and `O(n^3)` naive, so it is a fit for the *distinct-tag* set (tens of thousands), not for raw occurrences (millions).
+
+### K-Means and the extended vector space model
+
+K-Means partitions tags into **K predefined groups by minimizing the distance between points and their cluster centers**, iterating assign-then-recompute-centroid. The "extended vector space model" framing is the same idea viewed from information retrieval: represent each tag as a numeric vector and cluster in that space. It is fast (`O(n · K · iters)`), scales to more tags than agglomerative, and is what I reach for when I *already know* how many buckets I want (say, force the tail into ~200 canonical topics). Two catches on tag data: the mean of sparse binary/hash vectors is a fuzzy prototype that can be less interpretable than a real tag, and K-Means assumes convex, roughly equal-sized blobs — but tag frequencies are power-law, so a couple of huge hubs distort the centroids and orphan the tail. For sparse text vectors I prefer spherical K-Means (normalize, cosine distance, renormalize centroids).
+
+### Graph-based and neighborhood methods
+
+These connect related tags by **local density** rather than global centroids.
+
+- **KNN directed graph:** build edges from each tag to its k nearest neighbors by cosine similarity; connected components or community detection (label propagation, Louvain) become the clusters. This is exactly the right shape for co-occurrence: nodes are tags, edges are "appears together," and clusters fall out of graph structure.
+- **Affinity Propagation:** messages passed between candidates let the data elect its own exemplars, so it **chooses the number of clusters automatically** and returns a real representative tag per cluster — nice for tag normalization. It is `O(n^2)` memory and finicky about its damping/preference knobs, so I avoid it past a few tens of thousands of tags.
+- **Local Information Passing Clustering (LIPC):** a neighborhood-density approach suited to long-tailed, unevenly distributed labels like tags; it propagates local similarity to decide merges, which handles the sparse high-cardinality case better than centroid methods.
+
+## When the cluster count is unknown
+
+This is the decision that picks the algorithm for me:
+
+| Situation | What I pick | Why |
+| :-- | :-- | :-- |
+| K unknown, want to inspect granularity | Agglomerative (average linkage) | Cut the dendrogram, no K needed |
+| K unknown, want an exemplar tag per group | Affinity Propagation | Auto-selects clusters + representatives |
+| K unknown, clusters from co-occurrence | KNN graph + community detection | Matches the natural tag structure |
+| K known, very many tags | Spherical K-Means | Scales, forces tail into fixed buckets |
+| Uneven power-law density | LIPC | Handles sparse local structure |
+
+If someone asks me to "just run K-Means" without knowing K, I push back: on tag data K is rarely known in advance, and the elbow/silhouette search over K is more expensive and less stable than a single agglomerative pass with a threshold I can reason about.
+
+## A runnable example (pure standard library)
+
+My machine had neither NumPy nor scikit-learn available, so I wrote this with **only the Python standard library** (`zlib` for a deterministic feature hash, `math` for normalization). It embeds tags by hashing their word tokens into a fixed-width unit vector, then runs **average-linkage agglomerative clustering** with a cosine-distance threshold. `zlib.crc32` is deterministic across runs, unlike the built-in `hash()`, which is salted per process — that matters if you want reproducible output. Swap the `embed` function for a real tag2vec model and the rest is unchanged.
+
+```python
+import zlib, math
+
+# A toy tag vocabulary. Real systems have tens of thousands of tags.
+tags = [
+    "beach vacation", "beach holiday", "family beach trip",
+    "hiking trail", "mountain hiking", "trekking adventure",
+    "food tour", "street food", "fine dining",
+    "wine tasting", "winery tour",
+    "spa retreat", "wellness spa",
+]
+
+DIM = 512                       # wide enough to avoid feature-hash collisions
+def embed(text):
+    v = [0.0] * DIM
+    for w in text.lower().split():
+        v[zlib.crc32(w.encode()) % DIM] += 1.0   # deterministic feature hashing
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]                 # unit-normalise => cosine == dot
+
+vecs = {t: embed(t) for t in tags}
+def cosine(a, b): return sum(x * y for x, y in zip(a, b))
+def avg_link(c1, c2):                            # mean pairwise cosine distance
+    ds = [1.0 - cosine(vecs[a], vecs[b]) for a in c1 for b in c2]
+    return sum(ds) / len(ds)
+
+clusters = [[t] for t in tags]                   # every tag starts alone
+THRESHOLD = 0.70                                  # cut the dendrogram here
+while len(clusters) > 1:
+    best, bi, bj = None, -1, -1
+    for i in range(len(clusters)):
+        for j in range(i + 1, len(clusters)):
+            d = avg_link(clusters[i], clusters[j])
+            if best is None or d < best:
+                best, bi, bj = d, i, j
+    if best > THRESHOLD:
+        break
+    clusters[bi] += clusters[bj]                  # merge nearest pair
+    clusters.pop(bj)
+
+print(f"clusters: {len(clusters)}")
+for k, c in enumerate(sorted(clusters, key=lambda x: x[0]), 1):
+    print(f"group {k}: " + ", ".join(sorted(c)))
+```
+
+This is the output I actually got by running it with `python3`:
+
+```text
+clusters: 8
+group 1: beach holiday, beach vacation, family beach trip
+group 2: fine dining
+group 3: food tour, street food
+group 4: hiking trail, mountain hiking
+group 5: spa retreat, wellness spa
+group 6: trekking adventure
+group 7: wine tasting
+group 8: winery tour
+```
+
+Read it honestly: the algorithm merged every pair that shares a word — beach tags together, the two "hiking" tags, the two "food" tags, the two "spa" tags. The singletons ("fine dining", "trekking adventure", "wine tasting", "winery tour") stayed alone precisely because **word-token overlap was the only signal in this embedding**. "trekking adventure" is obviously near "hiking trail" to a human, but they share zero tokens, so a token-hash embedding cannot know that. That gap is exactly what a co-occurrence or tag2vec embedding closes: in production "trekking adventure" and "mountain hiking" co-occur on the same listings and would collapse into the hiking cluster. This toy makes the failure mode visible rather than hiding it behind a library call.
+
+<Warning>
+The threshold is doing all the work. A lower threshold shatters into near-exact-duplicate groups; a higher one chains unrelated tags through a bridge tag (single-linkage's classic failure). Because agglomerative clustering is greedy, merging early commits you — there is no undo, unlike a centroid method that can reassign. Pick the threshold on a labeled sample, not by feel, and prefer average-linkage over single-linkage when you have hub tags that co-occur with everything.
+</Warning>
+
+## What this leaves out for production
+
+- **Scale.** The loop is `O(n^3)`-ish and the vectors are dense lists. For 100K+ distinct tags I move to a sparse CSR matrix and scikit-learn's `AgglomerativeClustering` with a precomputed cosine distance matrix, or I go graph-based (build a KNN index over embeddings, run Louvain), which is the path I describe in [Scalable vector database](/scalablae-vector-database).
+- **Representation before clustering.** Most of the quality comes from the embedding, not the algorithm. Before tuning linkage I check whether a co-occurrence/PMI embedding or a transformer tag encoder pulls semantically-equal, lexically-different tags together.
+- **Evaluating without ground truth.** I use silhouette score on the cosine distances, or better, a small hand-labeled set of "should be same / should be different" tag pairs, and report precision on the merges.
+- **Downstream use.** Folded tag clusters become canonical features for [Customer segmentation](/customer-segmentation) — a user who uses five different "beach" tags collapses to one interest signal, which is the whole reason I normalize tags before profiling.
+
+The practical ordering I follow: fix the representation, then choose the algorithm by whether K is known, then tune the one threshold or K that actually changes the result. Everything else is noise.

@@ -1,54 +1,121 @@
 ---
-title: "What to expect in FDE GenAI Roles"
+title: "What to Expect in FDE GenAI Roles"
+description: "What a Forward Deployment Engineer working in Gen-AI actually does, what the interview loop tests, how the teaching and knowledge rounds are scored, and how to prepare for both."
 ---
 
-the panel will assess your understanding of Applied AI systems through scenario-based questions covering architecture, production systems, debugging, security, and engineering trade-offs.
+A Forward Deployment Engineer in Gen-AI is the role that exists because LLM demos do not survive contact with a customer's data, permissions, latency budget, or compliance reviewer. I am the engineer who goes to where the problem is, builds something that runs there, and stays until it is boring. That is a different job from "ML engineer" and a different job from "solutions architect", and the interview loop is designed to tell whether I understand the difference.
 
-- Introduce the real-world problem
-- Build intuition before introducing technical concepts
-- Explain the system using clear examples and diagrams
-- Discuss practical limitations and failure modes
+This page is what I know about the role and the loop, written from the interview guide I have in [RAGs](/rags) and the real questions I collected in [Interview data](/interivew-data).
 
-- The problem RAG solves, explained in simple language before introducing terminology
-- The complete RAG pipeline:
-  - Chunking
-  - Embedding
-  - Retrieval
-  - Generation
-- At least **2–3 common failure modes**, such as:
-  - Chunking losing context
-  - Retrieval recall vs. precision
-  - Stale indexes
-  - Lost in the Middle
-  - Query-document mismatch
-- When RAG is not the appropriate solution
-- A practical analogy that reinforces understanding
-- Audience engagement throughout the session
+## What the job actually is
 
-### **Your Answer should cover**
+The title comes from forward-deployed military engineering: you are positioned at the edge of the organisation, close to the thing that matters. In Gen-AI that means inside a customer's or a business unit's environment rather than inside my own platform team.
 
-- The problem AI Agents solve, explained in plain language before introducing terminology
-- The core agent loop:
-  - Perceive
-  - Reason / Plan
-  - Act (Tool Call)
-  - Observe
-  - Repeat
-- At least **2–3 common failure modes**, such as:
-  - Runaway or looping tool calls
-  - Error propagation across multi-step workflows
-  - Tool-call hallucinations
-  - Ambiguous delegation between agents
-  - Context or state loss during hand-offs
-- When an agent is not the appropriate solution
-- A practical analogy that reinforces understanding
-- Audience engagement throughout the session
+Concretely, the output of the role is a **working system in someone else's environment**, plus the trust that lets it keep running:
 
-- Fine-tuning vs Prompt Engineering vs RAG
-- Diagnosing production issues in RAG systems
-- Agent orchestration patterns
-- Multi-agent system design
-- Prompt injection and AI security
-- Guardrails and production best practices
-- Evaluation and observability of AI systems
-- Architectural trade-offs and engineering decisions
+- I take a vague business complaint ("our support agents repeat themselves", "the migration assessment takes three months") and turn it into a measurable system with a latency and cost budget.
+- I build the retrieval or agent pipeline end to end, including the parts nobody demos: evaluation, observability, guardrails, retries, and the invalidation path.
+- I work next to people who do not read my code, so explanation is a deliverable, not a courtesy. This is why every FDE loop I have seen contains a **teaching round** rather than only a coding round.
+- I own the trade-off conversation. The customer will get a model choice, a chunk size, and an SLA whether or not I chose them deliberately.
+
+The role's real skill is not prompt syntax. It is being able to say "RAG is the wrong tool here, and here is the number that proves it" and having the arithmetic to back it up, which is exactly the argument I keep in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer).
+
+## The skills the role assumes
+
+The interview guide I have covers architecture, production systems, debugging, security, and engineering trade-offs, and the panel assesses understanding of Applied AI systems through **scenario-based questions**. The underlying competency map I would study:
+
+| Area | What I need to be able to do | Where this site goes deeper |
+| :-- | :-- | :-- |
+| Retrieval | Chunk, embed, index, retrieve, rerank, and explain recall versus precision trade-offs | [RAGs](/rags), [Complete RAG tutorial](/complete-rag-tutorial) |
+| Sizing | Estimate tokens, chunks, vectors, and cost per query before choosing an architecture | [Data size estimation](/data-size-estimation) |
+| Serving | Vector store scaling, ANN index choice, quantization, sharding, hot partitions | [Scaling a Vector Database](/scalablae-vector-database) |
+| Latency and cost | Reason about prefill, TTFT, KV cache, and caching strategies | [Caching LLM Chats to Quickly Answer User Queries Without RAG](/caching-llm-chats-to-quick-answer-user-query-without-rag) |
+| Agents | Loop design, tool schemas, budgets, orchestration, multi-agent hand-offs | [Latest Terms in GenAI - 30 Sep](/latest-terms-in-gen-ai-30-sep) |
+| Evaluation | Groundedness, retrieval quality, regression gates, LLM-as-a-judge bias | [Sample Resume](/sample-resume) |
+| Security | Prompt injection, PII handling, guardrails, tool blast radius | [Interview data](/interivew-data) |
+| Vocabulary | Define the terms without hand-waving | [Latest Terms in GenAI - 30 Sep](/latest-terms-in-gen-ai-30-sep) |
+
+## The interview loop
+
+The loop I have documented is 50 to 60 minutes total, split into two parts.
+
+<Steps>
+  <Step title="Part 1 — Demo teaching round, 30 minutes">
+    I teach one topic — RAG, or AI agents and tool use — to a small group of new FDE hires who understand software engineering fundamentals but are new to Applied AI. I assume no prior knowledge and leave room for at least one audience interaction.
+  </Step>
+  <Step title="Part 2 — Knowledge and discussion round, 20 to 30 minutes">
+    After the teaching session the panel asks scenario-based questions to evaluate my understanding of modern Applied AI systems: production challenges, debugging approaches, and architectural decision-making. Questions are scenario-based and designed to assess practical problem-solving rather than theoretical memorization.
+  </Step>
+</Steps>
+
+The evaluation criteria are explicit in the guide, which I think is the most useful signal in the whole document: ability to teach from first principles, clarity of explanation and intuition building, technical understanding of Applied AI systems, system-level thinking, practical problem-solving and production awareness, and communication and learner engagement.
+
+Allowed tools: Python or Jupyter, VS Code, a whiteboard or diagrams, slides as optional support, and LangChain, LangGraph, CrewAI, or AutoGen if I want them. Frameworks are optional and should support conceptual explanations rather than replace them. The instruction I take most seriously: **avoid reading directly from notes**.
+
+<Tip>
+That last line is a filter, not a formality. An FDE presents to a customer's staff engineers who can smell a read-out script. The panel is checking whether I can hold the model in my head and answer the follow-up that goes one level deeper than my slide.
+</Tip>
+
+## The teaching round, decomposed
+
+The expected structure is the rubric, so I build the session to match it exactly:
+
+1. Introduce the real-world problem.
+2. Build intuition before introducing technical concepts.
+3. Explain the system using clear examples and diagrams.
+4. Discuss practical limitations and failure modes.
+5. Engage learners through questions or discussion.
+6. Summarize key takeaways.
+
+Step 2 is where most candidates lose the round. The guide's own example is blunt: before explaining RAG, first explain why LLMs struggle with external knowledge and why retrieval becomes necessary. Terminology is allowed only after the need for it exists. The same rule produces the standard opening for agents: a model that can only emit text cannot check anything, so a loop that perceives, plans, acts, and observes is what turns a prediction into work.
+
+For the **RAG topic**, the session must cover the complete pipeline — chunking, embedding, retrieval, generation — at least two or three common failure modes from this list, when RAG is not the appropriate solution, a practical analogy that reinforces understanding, and audience engagement throughout:
+
+- Chunking losing context, where the answer spans a boundary I chose for token-count reasons.
+- Retrieval recall versus precision, and the fact that I can only generate over what survived top-k.
+- Stale indexes, where the document changed and the vector did not.
+- Lost in the Middle, where position inside a long prompt changes whether the model uses the evidence.
+- Query-document mismatch, where the user's words and the document's words never overlap lexically.
+
+For the **agent topic**, the core loop is perceive, reason or plan, act through a tool call, observe, and repeat, and the failure modes I am expected to name:
+
+- Runaway or looping tool calls, which turn one cheap request into an unbounded spend.
+- Error propagation across multi-step workflows, where step 3's bad output silently becomes step 7's confident answer.
+- Tool-call hallucinations, including invented parameter names and endpoints that do not exist.
+- Ambiguous delegation between agents, where two agents both own the step, or neither does.
+- Context or state loss during hand-offs, the multi-agent version of a dropped session.
+
+I always close a teaching session with the "when not to use it" section, because that is where judgment shows. A one-time analysis of five candidates does not need an index. A deterministic workflow does not need an agent loop with unbounded steps.
+
+## The knowledge round
+
+The topic list from the guide, with the shape of the answer I give for each:
+
+- **Fine-tuning versus prompt engineering versus RAG.** I frame it as what each changes: prompts change behaviour at zero data cost, RAG changes the facts available and keeps provenance, fine-tuning changes the weights and is the slowest and least auditable. Freshness and citation needs usually eliminate fine-tuning as the primary answer.
+- **Diagnosing production issues in RAG systems.** I go stage by stage and measure: is retrieval missing the evidence, is the reranker reordering it away, is the context too long for the model to use it, or is generation ignoring grounded context? Each has a different metric and a different fix, and "the answers are bad" is not a diagnosis.
+- **Agent orchestration patterns.** Single loop with tools, planner-executor separation, supervisor with worker agents, and workflow-first graphs where the LLM only fills in steps. I pick by how much autonomy the task actually needs and what a wrong step costs.
+- **Multi-agent system design.** The interesting problems are shared state, hand-off contracts, and cancellation, not the org chart of agents. Most multi-agent designs I review would be better single-agent workflows with clearer tool schemas.
+- **Prompt injection and AI security.** Retrieval and tool output are untrusted input. The model cannot separate data from instruction, so control has to live outside it: capability scoping, allow-listed tools, approval gates on writes, and least privilege on every credential a tool can reach.
+- **Guardrails and production best practices.** Input filtering, output schema validation, PII redaction, confidence-based routing, retries with budgets, circuit breakers, and human approval on irreversible actions. See the reliability stack described in [Sample Resume](/sample-resume).
+- **Evaluation and observability of AI systems.** Retrieval metrics offline, groundedness and answer quality per release, regression gates in CI, and traces that let me reconstruct one production answer from a screenshot. If I cannot replay a bad response, I cannot fix it.
+- **Architectural trade-offs and engineering decisions.** Every answer here is a number: cost per query, tokens per prompt, recall at a latency ceiling. See [Data size estimation](/data-size-estimation) for how I get those numbers quickly under interview pressure.
+
+<Note>
+The guide says questions will primarily be scenario-based and designed to assess practical problem-solving rather than theoretical memorization. My preparation follows from that: I do not memorize definitions, I rehearse four moves — restate the constraint, name the trade-off, quantify it, then say what would change my answer. Non-AI system design shows up too; [Interview data](/interivew-data) has a rate-limiter race condition, a Redis Lua sliding-window implementation, a Postgres planner ignoring a composite index over 2 million rows, and an active-active two-region collaborative editor with EU data residency and a 120 ms cross-region link. The FDE loop is a full senior engineering loop with an AI layer on top, not an AI trivia loop.
+</Note>
+
+## The day-to-day
+
+What I actually do in a week, once hired:
+
+- Most hours go into **data plumbing that has no glamour**: getting the customer's documents into chunks that survive their formatting, and getting their permissions into my filter.
+- A large fraction of the job is **explaining and calibrating expectations**: showing the customer why recall@5 at 200 ms costs more than recall@20 at 2 s, and which one their use case should pick.
+- I write **evaluation before scale**. A pipeline without a scored eval set cannot be changed safely, and every FDE engagement I have seen accumulates technical debt exactly where evaluation was skipped.
+- I am on call for my own demo-to-production delta. The failure modes are known and named above, so the bar is having measured them, not discovering them.
+- I ship artefacts other people can run: a repo, a runbook, a dashboard. Leaving a system nobody can operate is a failed engagement regardless of the demo.
+
+## How I would prepare
+
+Three weeks, in this order: pick one of the two teaching topics and deliver it out loud to a software engineer who does not do AI, timed at 30 minutes with one interaction; write the failure-mode list from memory and attach a metric and a fix to each; and build one end-to-end pipeline I can defend line by line, which is what [Complete RAG tutorial](/complete-rag-tutorial) is for. Then rehearse the "when not to use this" answer, because that is the question the panel asks last and the one that decides the hire.
+
+If I am hiring instead of interviewing, the goal of this round as written is the right screen: assess whether the candidate can help learners understand not just how AI systems work, but why they are designed that way and what the trade-offs are when building them.

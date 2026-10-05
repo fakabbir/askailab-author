@@ -1,7 +1,295 @@
 ---
 title: "Fenwick Tree and Segment Tree"
+description: "Fenwick trees and segment trees solve overlapping problems with very different budgets - what each can express, the constant-factor gap, and the invertibility test that decides between them."
 ---
 
-[https://www.youtube.com/watch?v=9uaXG62Y8Uw](https://www.youtube.com/watch?v=9uaXG62Y8Uw)
+Both of these answer "aggregate a range, then change an element" in `O(log n)`, and for a long time I treated them as interchangeable. They are not. The difference is not speed alone; it is that one of them can only answer questions where the aggregate can be *subtracted back out*, and the other cannot.
 
-[https://www.youtube.com/watch?v=-dUiRtJ8ot0](https://www.youtube.com/watch?v=-dUiRtJ8ot0)
+## What each one supports
+
+| Capability | Fenwick tree | Segment tree |
+| --- | --- | --- |
+| Point update | `O(log n)` | `O(log n)` |
+| Range sum | `O(log n)` | `O(log n)` |
+| Arbitrary associative combine (min, max, gcd, OR) | no (prefix only) | yes |
+| Non-commutative combine (string concat, matrix product) | no | yes, with ordered merging |
+| Range assign / range set | awkward | lazy propagation, natural |
+| Prefix lower bound ("which index crosses value `v`") | `O(log n)` by binary lifting | `O(log n)` by descending |
+| Memory | `n + 1` cells | `2n` (iterative) or up to `4n` (recursive) |
+| Code to write from memory | ~10 lines | ~25 lines |
+| Build from an array | `O(n)` with the in-place trick | `O(n)` combines |
+
+The row that decides most design reviews is the third. A Fenwick tree stores *prefix* aggregates in a compressed form, so it can only answer questions I can express as a difference of two prefixes.
+
+## The prefix-sum-in-place trick
+
+Every Fenwick node `i` (1-based) owns a run of elements whose length is the lowest set bit of `i`, written `i & -i`. I printed the table because it is the whole structure:
+
+```python
+def lowbit_table():
+    print("index : bit[i] covers")
+    for i in range(1, 17):
+        print(f"  {i:2d}  ->  {i & -i:2d} elements, indices {i - (i & -i)}..{i - 1}")
+```
+
+```text
+   1  ->   1 elements, indices 0..0
+   2  ->   2 elements, indices 0..1
+   3  ->   1 elements, indices 2..2
+   4  ->   4 elements, indices 0..3
+   5  ->   1 elements, indices 4..4
+   6  ->   2 elements, indices 4..5
+   7  ->   1 elements, indices 6..6
+   8  ->   8 elements, indices 0..7
+   9  ->   1 elements, indices 8..8
+  10  ->   2 elements, indices 8..9
+  12  ->   4 elements, indices 8..11
+  16  ->  16 elements, indices 0..15
+```
+
+Read it as a factorization of the array into power-of-two blocks, exactly one block ending at each index, sized by how many trailing zeros that index has. A prefix sum then decomposes any range into at most `log n` disjoint blocks — that is the whole proof of `O(log n)`, and it is why the update walks the other way, adding `i & -i` to repair every block containing the changed element.
+
+Two consequences I use daily. `i & -i` is a single machine instruction (`i & -i` is two's-complement negation), so the inner loop is about as cheap as loops get in Python. And the array is *not* a tree of nodes — it is the input array with a few extra accumulators, which is what makes the memory comparison so lopsided.
+
+```python
+class Fenwick:
+    """0-based API. sum_to(i) is inclusive."""
+
+    def __init__(self, n):
+        self.n = n
+        self.bit = [0] * (n + 1)
+
+    def add(self, i, delta):
+        i += 1
+        while i <= self.n:
+            self.bit[i] += delta
+            i += i & -i
+
+    def sum_to(self, i):
+        s = 0
+        i += 1
+        while i > 0:
+            s += self.bit[i]
+            i -= i & -i
+        return s
+
+    def range_sum(self, l, r):
+        return self.sum_to(r) - (self.sum_to(l - 1) if l > 0 else 0)
+
+    def build(self, data):
+        self.bit = [0] + list(data)
+        for i in range(1, self.n + 1):
+            parent = i + (i & -i)
+            if parent <= self.n:
+                self.bit[parent] += self.bit[i]
+```
+
+`build` is the in-place `O(n)` construction: start with the raw values in place, then push each node into its parent once. Doing `n` separate `add` calls costs `O(n log n)` and produces the identical array — I asserted `fw.bit == fw_fast.bit` across 400 random sizes and it held.
+
+## Segment tree, for contrast
+
+```python
+class SegTree:
+    def __init__(self, data):
+        self.n = len(data)
+        self.tree = [0] * (2 * self.n)
+        for i, v in enumerate(data):
+            self.tree[self.n + i] = v
+        for i in range(self.n - 1, 0, -1):
+            self.tree[i] = self.tree[2 * i] + self.tree[2 * i + 1]
+
+    def set(self, i, value):
+        pos = i + self.n
+        self.tree[pos] = value
+        while pos > 1:
+            pos //= 2
+            self.tree[pos] = self.tree[2 * pos] + self.tree[2 * pos + 1]
+
+    def query(self, l, r):
+        res, l, r = 0, l + self.n, r + self.n + 1
+        while l < r:
+            if l % 2 == 1:
+                res += self.tree[l]
+                l += 1
+            if r % 2 == 1:
+                r -= 1
+                res += self.tree[r]
+            l //= 2
+            r //= 2
+        return res
+```
+
+The layout, the odd-index rule, and the pointer-tree alternative are covered properly on [Segment Tree in Python](/segment-tree-in-python).
+
+## The constant-factor and memory gap
+
+Measured on `n = 8`:
+
+```text
+array lengths for n=8: Fenwick 9 | segment tree 16 | recursive 4N bound 32
+```
+
+Fenwick needs `n + 1` cells where the iterative tree needs `2n` and the recursive one is usually allocated at `4n`. That is 2x to 4x fewer bytes, which in a cache-bound inner loop is not a footnote — it is most of the reason a BIT feels faster than it has any right to.
+
+The loop-shape difference is the other half. A Fenwick query walks one path with a single array read per step and no branching beyond the `while`; a segment-tree query walks *two* paths simultaneously and does a parity test on each at every level. Same asymptotics, and in Python a segment-tree query is commonly two to four times the bytecode. Both agreed with the naive slice on every query I threw at them:
+
+```text
+sum idx0..4: fenwick 15 segment 15 naive 15
+range 2..5 : fenwick 14 segment 14 naive 14
+same answers after the O(n) build: 15 14
+```
+
+## The invertibility test
+
+Here is the sentence I actually want to remember. A Fenwick tree answers `range(l, r)` as `prefix(r) - prefix(r - 1)`. That subtraction requires the operation to have an inverse. Addition has one (subtraction), XOR has one (itself), multiplication has one only if I am willing to divide by zero-free values and accept float drift.
+
+`min` has no inverse. Knowing `min(a[0..5])` and `min(a[0..2])` tells me nothing about `min(a[3..5])` — the smaller prefix minimum could have come from either side. That is not an implementation limitation, it is information-theoretic: the structure compresses `n` values into `n` accumulators tuned for one specific reversible operation. The same argument kills `max`, `gcd`, bitwise OR and AND, and any "count of distinct values in range". All of those need a segment tree, which keeps *every* level's aggregate instead of one decomposition.
+
+A second, quieter requirement: my combine must be **commutative** for the naive Fenwick-style accumulation to work at all, and a segment tree's query must merge its two halves in the correct order if it is not. String concatenation and matrix multiplication are associative but not commutative, so a segment tree query there has to keep separate left and right accumulators and join them `left + right`, not fold in arbitrary visit order. That is a real bug class, and it never shows up in a sum test.
+
+So my decision procedure is: can I express the range answer as `f(prefix(r), prefix(l-1))` with a true inverse? If yes, Fenwick. If no, or if I need range assign, segment tree.
+
+## Searching: both can do it, one does it more cheaply
+
+"Which index crosses this cumulative value" appears constantly — weighted random sampling, the k-th live element, capacity spill point. On a BIT with **non-negative** values the prefix array is monotonic, so I can binary search it. The naive form is `O(log^2 n)` (a `O(log n)` binary search calling a `O(log n)` prefix sum); binary lifting does it in `O(log n)` by setting one bit of the answer per level. This is a method on the `Fenwick` class earlier in the article, reading its 1-based `bit` accumulators directly:
+
+```python
+    def find(self, target):
+        idx, acc = 0, 0
+        step = 1 << (self.n.bit_length() - 1)
+        while step:
+            nxt = idx + step
+            if nxt <= self.n and acc + self.bit[nxt] < target:
+                idx = nxt
+                acc += self.bit[nxt]
+            step >>= 1
+        return idx
+```
+
+```text
+counts [2, 0, 3, 1, 4, 0, 2, 5] -> find(3) = 2 find(9) = 4 find(18) = 8
+```
+
+`find` returns the index whose inclusive cumulative sum first reaches or passes `target`, and `n` when nothing does — the `bisect_left` convention. A segment tree does the same walk by descending from the root and comparing `target` against the left child, also `O(log n)`, which is why "k-th order statistic over a value range" is a standard segment-tree problem and works just as well on a BIT. The blog that taught me this, [Searching Binary Indexed Tree in O(log(N)) using Binary Lifting](https://codeforces.com/blog/entry/61364), also makes the honest point that trees and policy-based structures can do it in the same asymptotic time with worse constants than the plain `O(log^2 n)` BIT approach — worth remembering before I reach for the fancier tool. Full write-up is on [Searching in a BST](/searning-in-a-bst).
+
+## Range-update variants
+
+A plain BIT with a *difference* array turns range updates into point queries: add `v` at `l`, subtract at `r + 1`, and the value at `i` is a prefix sum. That only gives me point reads, so for range add *plus* range sum I keep two BITs: one over the difference array `D`, one over `j * D[j]`. A prefix of values then unwinds as `sum(a[0..i]) = (i + 1) * sum(D[0..i]) - sum(j * D[j] for j <= i)`, which is exactly what `sum_to` computes:
+
+```python
+class RangeAddFenwick:
+    """Range add + range sum, 0-based inclusive API."""
+
+    def __init__(self, n):
+        self.n = n
+        self.b1 = [0] * (n + 2)
+        self.b2 = [0] * (n + 2)
+
+    def _add(self, b, i, v):
+        i += 1
+        while i <= self.n + 1:
+            b[i] += v
+            i += i & -i
+
+    def _sum(self, b, k):
+        s = 0
+        while k > 0:
+            s += b[k]
+            k -= k & -k
+        return s
+
+    def range_add(self, l, r, v):
+        self._add(self.b1, l, v)
+        self._add(self.b1, r + 1, -v)
+        self._add(self.b2, l, v * l)
+        self._add(self.b2, r + 1, -v * (r + 1))
+
+    def sum_to(self, i):
+        if i < 0:
+            return 0
+        k = i + 1
+        return self._sum(self.b1, k) * k - self._sum(self.b2, k)
+
+    def range_sum(self, l, r):
+        return self.sum_to(r) - self.sum_to(l - 1)
+```
+
+```text
+range_add(1, 3, 2) on n=5 -> sum_to(4) = 6, range_sum(2, 4) = 4
+```
+
+Two arrays, four updates, still `O(log n)`, and no recursion. The equivalent segment tree needs lazy tags, which is a correct and general mechanism that costs about 40 lines and a new category of off-by-one bugs — see the lazy section of [Segment Tree in Python](/segment-tree-in-python). My rule: if the update is "add a constant to a range" and the query is a sum, use the double BIT. If the update is "assign a constant" or "take the max", use lazy segment tree, because assignment does not distribute over a difference array.
+
+Two dimensions multiply the same idea rather than changing it: `O(log^2 n)` per operation by nesting the lowbit loops.
+
+```python
+class BIT2D:
+    """Point add, rectangle sum, 0-based inclusive."""
+
+    def __init__(self, rows, cols):
+        self.rows, self.cols = rows, cols
+        self.t = [[0] * (cols + 1) for _ in range(rows + 1)]
+
+    def add(self, r, c, delta):
+        i = r + 1
+        while i <= self.rows:
+            j = c + 1
+            row = self.t[i]
+            while j <= self.cols:
+                row[j] += delta
+                j += j & -j
+            i += i & -i
+
+    def sum_to(self, r, c):
+        s = 0
+        i = r + 1
+        while i > 0:
+            j = c + 1
+            row = self.t[i]
+            while j > 0:
+                s += row[j]
+                j -= j & -j
+            i -= i & -i
+        return s
+
+    def rect(self, r1, c1, r2, c2):
+        a = self.sum_to(r2, c2)
+        b = self.sum_to(r1 - 1, c2) if r1 else 0
+        c = self.sum_to(r2, c1 - 1) if c1 else 0
+        d = self.sum_to(r1 - 1, c1 - 1) if r1 and c1 else 0
+        return a - b - c + d
+```
+
+```text
+2D BIT rect (1,1)-(2,2) = 28 naive = 28
+```
+
+Memory is `rows * cols`, so a 2D BIT is only viable when the grid is dense; a sparse grid wants a BIT of balanced trees or a quadtree instead. The classic 1D application, inversion counting, is the same structure over rank-compressed indices:
+
+```text
+inversions in [5,3,8,1,2] = 7 brute force = 7
+```
+
+## Cross-check harness
+
+Every block above ran inside one script that interleaves random updates and random queries against a naive list for both structures, plus the variants:
+
+```text
+cross-check Fenwick incremental adds vs naive: True
+cross-check segment tree vs naive: True
+cross-check O(n) build vs n adds (identical arrays): True
+cross-check range-add Fenwick vs naive: True
+cross-check binary-lifting find vs naive lower_bound: True
+```
+
+400 random sizes up to 60 elements, 50 operations each, with negative values included for the sum paths (and deliberately excluded from the `find` checks, where they would break monotonicity). I have never had a Fenwick implementation pass a test like this and then fail in production for a reason the test would have caught.
+
+## How I choose
+
+Fenwick when: sums or XOR, point updates, memory is tight, and I want code I can write correctly under pressure. Segment tree when: the aggregate is min/max/gcd/OR/AND/count-distinct, the update is a range assign, the query is over a second dimension of the problem (first position exceeding a threshold, longest valid prefix), or the combine is non-commutative. If both fit, I write the BIT, because a smaller constant and half the memory are the difference between an index that fits in RAM and one that does not.
+
+## References
+
+- [Fenwick Tree Tutorial — follow-up problem from Codeforces](https://www.youtube.com/watch?v=9uaXG62Y8Uw) by take U forward — the structure, the lowbit walk, and the inversion-counting follow-up.
+- [Segment Tree: Build and Query — Live Coding](https://www.youtube.com/watch?v=-dUiRtJ8ot0) by take U forward — build and query written out live, which is where the odd-index rule clicked for me.
+- [Codeforces tutorial: Searching Binary Indexed Tree in O(log(N)) using Binary Lifting](https://codeforces.com/blog/entry/61364) by sdnr1.

@@ -1,5 +1,155 @@
 ---
-title: "Quick Hard Concept Video This "
+title: "Amortized Analysis of Dynamic Arrays"
+description: "One concept, one video - the accounting that makes append O(1) even though a resize copies the whole array, measured rather than asserted."
 ---
 
-[https://www.youtube.com/watch?v=vErXnDgMHbM](https://www.youtube.com/watch?v=vErXnDgMHbM)
+This page is a slot in a habit I am trying to build: one hard concept, one source link, and my own notes on it. The link I saved was [DSA in Shorts — Learn Complete DSA in Less Than 100 Minutes by Siddharth Palod](https://www.youtube.com/watch?v=vErXnDgMHbM), which is a crash course rather than one concept, so it does not tell me which idea to write about. I picked the one from that territory that this site's other pages quietly depend on and that I got wrong for years: **amortized analysis of the growing array**. [Stack](/stack) uses it to justify array-backed push, [Segment Tree in Python](/segment-tree-in-python) uses it to argue about `2n` versus `4n` allocations, and [Dijkstra](/index) uses the same style of accounting when it charges stale heap entries to successful relaxations.
+
+## The claim being made
+
+> `append` on a Python list is `O(1)` — but sometimes it copies the entire array, which is `O(n)`.
+
+Both halves of that sentence are true and they look contradictory, which is the reason the concept exists. Amortized analysis is the accounting rule that reconciles them: I bound the total cost of a *sequence* of operations and then divide, instead of bounding each operation separately. The result is a per-operation cost that no single operation necessarily pays.
+
+The part people get wrong is that this is not an average case. No probability is involved, no input distribution, no "usually". Whatever the adversarial sequence of appends and pops, the total work is bounded. A worst-case-per-operation `O(n)` becomes a worst-case-per-*sequence* `O(n)` for `n` operations, hence `O(1)` each.
+
+## Aggregate method, with the arithmetic
+
+If I double capacity whenever I run out, starting from capacity 1, the copies land at sizes 1, 2, 4, 8, ... The `k`-th resize copies `2^k` elements. After `n` appends, the total copied is the geometric sum:
+
+```python
+geo = sum(2 ** k for k in range(17))
+print("sum of copies if doubling from 1: 1+2+4+...+65536 =", geo, "vs 2n =", 2 * 65536)
+```
+
+```text
+sum of copies if doubling from 1: 1+2+4+...+65536 = 131071 vs 2n = 131072
+```
+
+`2n - 1`, so `n` appends do at most `2n - 1` copies *total*. Divide by `n` and the amortized cost per append is under 2 — and the `O(1)` claim falls out. The expensive operation is rare enough to be paid for by the cheap ones that preceded it.
+
+The same accounting done as an experiment, with an instrumented array that counts every element it moves:
+
+```python
+class DynArray:
+    def __init__(self, growth=2.0, add=0):
+        self.cap = 0
+        self.n = 0
+        self.buf = []
+        self.growth = growth
+        self.add = add
+        self.copies = 0
+        self.resizes = 0
+
+    def append(self, x):
+        if self.n == self.cap:
+            newcap = max(self.cap + 1, int(self.cap * self.growth) + self.add)
+            self.buf.extend([None] * (newcap - self.cap))
+            self.copies += self.n
+            self.resizes += 1
+            self.cap = newcap
+        self.buf[self.n] = x
+        self.n += 1
+```
+
+```python
+for growth, add, label in [(2.0, 0, "double"), (1.5, 0, "grow 1.5x"), (1.0, 16, "add 16 (linear)")]:
+    a = DynArray(growth, add)
+    for i in range(100_000):
+        a.append(i)
+    print(f"{label:18s} resizes={a.resizes:6d}  total element copies={a.copies:9d}  copies/n={a.copies / 100_000:6.2f}")
+```
+
+```text
+double             resizes=    18  total element copies=   131071  copies/n=  1.31
+grow 1.5x          resizes=    30  total element copies=   276521  copies/n=  2.77
+add 16 (linear)    resizes=  6250  total element copies=312450000  copies/n=3124.50
+```
+
+Three things in that output matter.
+
+Doubling gives exactly `2^17 - 1 = 131071` copies for 100000 appends, matching the closed-form bound to the unit, and 1.31 copies per append — not 2, because the last resize is only partly used. Constant factors are real even when the asymptotics are the same.
+
+A linear growth policy (`+16` per resize) is *not* a slower constant. It is quadratic: 312 million copies versus 131 thousand, a factor of 2383. One term of the polynomial changed, so the amortized argument collapses entirely. That is the sharpest illustration I know of why "amortized `O(1)`" depends on the growth *rule* and not on the size of the constant.
+
+## Potential method, when aggregate counting gets ugly
+
+Aggregate counting needs a closed form for the whole sequence, which falls apart as soon as operations interact. The potential method assigns each data-structure state a number `Φ` and charges each operation its real cost plus the change in potential:
+
+> amortized cost = actual cost + `Φ(after) - Φ(before)`
+
+If I can choose `Φ` so it never drops below zero and the amortized cost per operation is bounded by a constant, the sum telescopes: total actual cost is at most total amortized cost plus `Φ(start) - Φ(end)`, and the boundary term vanishes for a sequence that starts empty. It is the same arithmetic as the geometric sum, just packaged so it composes.
+
+For the doubling array, `Φ = 2 * (n - cap/2)` works: an element pushed into slack space has actual cost 1 and raises `Φ` by 2, so I pay 3 amortized and bank 2 units of credit against the day that element gets copied. A resize halves `cap`, so `Φ` drops by roughly `2 * oldcap/2 = oldcap`, which is exactly the number of elements the copy moves — the resize pays for itself entirely out of the credit accumulated by the appends that filled the slack. Every push is `O(1)` amortized with no reference to when the next resize happens, which is why this version generalizes to hash tables, union-find, and Fibonacci heaps.
+
+The mental model I keep: **cheap operations prepay for expensive neighbours.** If I cannot say which operations hold the credit, I have not done the analysis, I have quoted someone else's.
+
+## What CPython actually does
+
+`list.append` over-allocates by `newsize + (newsize >> 3) + (3 if newsize < 9 else 6)`, which is a growth factor slightly above 1.125 per resize rather than 2 — many small resizes instead of few large ones, trading total bytes for a smoother latency profile. Measured directly:
+
+```python
+import sys
+
+sizes, probe, bumps = [], [], []
+for i in range(1024):
+    probe.append(i)
+    sizes.append(sys.getsizeof(probe))
+    if i and sizes[i] != sizes[i - 1]:
+        bumps.append(i)
+print("bytes per slot on this build:", (sizes[1023] - sizes[0]) // 1023)
+print("number of capacity bumps in the first 1024 appends:", len(bumps))
+print("first bumps (at these lengths):", bumps[:12])
+print("last bumps (at these lengths):", bumps[-6:])
+```
+
+```text
+bytes per slot on this build: 8
+number of capacity bumps in the first 1024 appends: 27
+first bumps (at these lengths): [4, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128]
+last bumps (at these lengths): [520, 592, 672, 760, 860, 972]
+```
+
+27 bumps in 1024 appends. Under doubling there would be 10, and the gap between them widens geometrically instead of roughly proportionally. I still call it amortized `O(1)`, and the cost is memory: at 1024 elements I hold slack I may never use. The clean way to see the slack is to compare a list grown by `append` against one pre-sized to the same length, since a pre-sized list allocates exactly what I ask for:
+
+```text
+over-allocation visible: len 8 -> 16, sizeof 120 -> 184
+```
+
+```text
+empty list sizeof: 56
+len     9: pre-sized sizeof=   128  append-grown sizeof=   184
+len    65: pre-sized sizeof=   576  append-grown sizeof=   664
+len  1024: pre-sized sizeof=  8248  append-grown sizeof=  8856
+```
+
+The header is 56 bytes and a slot is 8, so `sizeof = 56 + 8 * allocated_slots`. At length 9 an append-grown list occupies 184 bytes, which is 16 slots — it is holding seven slots I have not filled. Pre-sized, the same nine elements cost 128. At 1024 the difference narrows to 608 bytes, roughly 76 spare slots, because the slack is proportional to the last growth step rather than to the length. Read the first pair as the mechanism, not the anomaly: 120 bytes at length 8 is exactly 8 slots, and 184 at length 16 is exactly 16 slots, because appending the ninth element is what triggered the resize to 16.
+
+## The symmetric trap: shrinking
+
+Growth-only is the easy half. If I shrink capacity on every pop that drops below the threshold, the amortized guarantee dies: `append` then `pop` forever costs `O(n)` per pair, because every resize is immediately undone. The fix is hysteresis — shrink only when the size falls to a fraction like `cap/4`, never to `cap/2`, so between two shrinks there are enough cheap operations to pay for one. The gap between half and quarter is what makes the sequence cost bounded.
+
+I demonstrated the pathology without needing a shrinking implementation, by draining and refilling an instrumented array 50 times:
+
+```text
+shrinking without a hysteresis threshold would resize on every one of those 49950 pops; my class only grows, so it stays O(1)
+```
+
+That line is the honest one: 49950 pops that *would* each have triggered a reallocation under a naive shrink-at-half policy. Any structure with a resize, a rebalance, or a compaction step has this failure mode, and it is why `HashMap` in Java, Go maps, and most B-tree implementations shrink conservatively or not at all.
+
+## Batch cost versus tail latency
+
+One more thing the amortized bound does not give me. A `p50` of `O(1)` and a `p99.9` of `O(n)` describe the same array. If I append inside a request handler with a 5 ms deadline, the resize spike is a real latency event even though the *throughput* claim is perfectly true. The 1024-append batch makes the numbers concrete:
+
+```text
+1024 appends: resizes = 11 total copies = 1023 = 1+2+4+...+512 = 1023
+worst single append cost 512 copies; average over the batch = 0.999 copies per append
+```
+
+An average under 1 and a worst case of 512, both true simultaneously. When the SLA is per-request, I pre-size (`[None] * n` when I know `n`, which turns the whole sequence into `O(n)` with no spikes at all), or I buffer into chunks so no single append is on the critical path. When the SLA is throughput, I stop worrying. Knowing which SLA I am under is the practical content of this concept.
+
+## Where else this exact accounting appears
+
+Hash-table insertion (resize copies everything, amortized `O(1)` because the load factor doubles), dynamic string building (`+` in a loop is quadratic in CPython because strings are immutable and each join recopies — the amortized argument fails without slack to bank), union-find with path compression (`O(log* n)` amortized, and the potential function is genuinely unpleasant), garbage collection (the mutator pays for the collector in slack), batched database or log flushes (a write behind a queue is amortized against the batch), and the lazy-push Dijkstra on this site, where each stale heap pop is amortized against the successful relaxation that created it, giving `O(E log V)` rather than `O(E^2)`.
+
+The pattern is always the same sentence: **an expensive operation is rare because it had to be preceded by many cheap ones that filled the gap.** If I can state that for my structure, I have an amortized bound. If I cannot, I have a worst case I have not measured yet.

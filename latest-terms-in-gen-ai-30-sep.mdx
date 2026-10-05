@@ -1,28 +1,87 @@
 ---
 title: "Latest Terms in GenAI - 30 Sep"
+description: "A dated snapshot of the Gen-AI vocabulary that mattered on 30 September, with what each term does and why it matters in production."
 ---
 
-**Core Architecture and Models**
+This is a snapshot glossary, and the date is the point: it reflects the vocabulary in circulation on **30 September**, the same September 2026 window in which the model comparisons in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) and the pricing in [User usage at scale](/user-usage) were collected. Term lists go stale faster than code. In six months some of these will be table stakes and others will be marketing noise, so I keep the list dated rather than pretending it is evergreen.
 
-- **Transformers:** Neural networks that use self-attention to process words in relation to one another, forming the base of modern language models. [[1](https://www.linkedin.com/posts/piyush-ranjan-9297a632_top-gen-ai-terms-you-should-know-in-2025-activity-7379508015143743489-ewu4), [2](https://faculty.ai/en-gb/insights/articles/your-essential-guide-to-genai-terminology-the-top-words-to-know), [3](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1)]
-- **Multimodal Models:** Systems that process and integrate multiple data types at once, including text, images, audio, and video. [[1](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1)]
-- **Small Language Models (SLMs):** Compact, highly efficient models designed to run quickly on edge devices and local hardware with lower resource use. [[1](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1)]
-- **Reasoning Models:** Advanced models engineered to execute multi-step logic and internal deliberation before answering complex math, coding, or logic tasks. [[1](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1)]
-- **Mixture of Experts (MoE):** An architecture that routes specific tasks to specialized sub-networks within a larger model, improving speed and efficiency. [[1](https://platform.teamai.com/blog/generative-ai-and-business/ai-terms-everyone-should-know/)]
+I use two tests before I let a term into an architecture document. First, can I state what breaks if I ignore it? Second, does it change a number I have to size — latency, memory, cost per query, recall? The terms below pass both, which is why each entry ends with a production consequence rather than a restatement of the definition.
 
-**Advanced Techniques and Processing**
+If I am reading a term list from another source, I check it against [Piyush Ranjan's top Gen-AI terms](https://www.linkedin.com/posts/piyush-ranjan-9297a632_top-gen-ai-terms-you-should-know-in-2025-activity-7379508015143743489-ewu4), [Faculty's essential GenAI terminology guide](https://faculty.ai/en-gb/insights/articles/your-essential-guide-to-genai-terminology-the-top-words-to-know), [Vishal Chauhan's must-know GenAI terms](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1), [TeamAI's terms everyone should know](https://platform.teamai.com/blog/generative-ai-and-business/ai-terms-everyone-should-know/), [Level Up's 12 essential GenAI terms](https://levelup.gitconnected.com/12-essential-genai-terms-you-need-to-know-in-2025-3fd5b928cb37), and [Pankaj Shakya's LLM terminology explainer](https://medium.com/@pankajshakya627/ai-generative-ai-llm-terminology-explained-ca6805a79da5). None of them agree on the boundary between "architecture" and "feature", which is why I have grouped mine by what I have to do about each one.
 
-- **Retrieval-Augmented Generation (RAG):** A method that lets an LLM pull fresh facts from external databases before answering, reducing the need to retrain the model. [[1](https://levelup.gitconnected.com/12-essential-genai-terms-you-need-to-know-in-2025-3fd5b928cb37), [2](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1)]
-- **Chain-of-Thought (CoT):** A prompting technique that encourages the model to write out its step-by-step reasoning process to solve hard problems. [[1](https://www.linkedin.com/posts/piyush-ranjan-9297a632_top-gen-ai-terms-you-should-know-in-2025-activity-7379508015143743489-ewu4)]
-- **Embeddings and Vector Databases:** Numerical vectors that capture semantic meaning, stored in specialized vector databases to enable fast similarity searches. [[1](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1), [2](https://platform.teamai.com/blog/generative-ai-and-business/ai-terms-everyone-should-know/)]
-- **Quantization:** A process that shrinks model size and memory usage by lowering the precision of its numerical weights.
-- **KV Cache:** A memory optimization technique used during inference to store previous key-value calculations and speed up response generation. [[1](https://medium.com/@pankajshakya627/ai-generative-ai-llm-terminology-explained-ca6805a79da5)]
+## Core architecture and models
 
-**Systems and Orchestration**
+These are the terms that decide which model I can even serve, and on what hardware.
 
-- **Agentic AI:** Autonomous AI systems designed to plan, use tools, and execute multi-step workflows toward a specific goal without constant human prodding.
-- **Model Context Protocol (MCP):** An open standard that simplifies how AI models securely connect to external tools, data sources, and software.
-- **Guardrails:** Safety and compliance filters placed around an LLM to block toxic language, personal data leaks, and off-topic or illegal responses.
-- **LLM-as-a-Judge:** Using a powerful secondary AI model to evaluate, score, and test the outputs of another model automatically. [[1](https://faculty.ai/en-gb/insights/articles/your-essential-guide-to-genai-terminology-the-top-words-to-know), [2](https://medium.com/@chauhanvishal9963/must-know-terms-for-generative-ai-genai-b506e6f25ee1), [3](https://platform.teamai.com/blog/generative-ai-and-business/ai-terms-everyone-should-know/), [4](https://medium.com/@pankajshakya627/ai-generative-ai-llm-terminology-explained-ca6805a79da5)]
+**Transformers.** Neural networks that use self-attention to process words in relation to one another, forming the base of modern language models.
+*Why it matters in production:* self-attention is why cost and latency grow with context length rather than staying flat — every token attends to the tokens before it, so a longer prompt is not proportionally more expensive, it is disproportionately more expensive to prefill. Half the capacity arguments in [Scalable vector database](/scalablae-vector-database) and this site's token budgeting trace back to this one property.
 
-If you'd like, I can dive deeper into **Agentic AI workflows**, explain **Model Context Protocol (MCP)**, or break down how **RAG** works. Let me know what you want to explore!
+**Multimodal models.** Systems that process and integrate multiple data types at once, including text, images, audio, and video.
+*Why it matters in production:* a document with a chart is not text to a multimodal model, and the token math changes. Image and audio inputs bill as many more tokens than the same content transcribed, so my per-request estimate has to be measured on real inputs, not on the text layer.
+
+**Small language models (SLMs).** Compact, highly efficient models designed to run quickly on edge devices and local hardware with lower resource use.
+*Why it matters in production:* they are the answer to "we need this on-device" or "we cannot pay frontier prices for a classifier". The trade is quality on long-horizon reasoning, so I use them where the task is narrow and the volume is high — routing, extraction, intent classification — not for the hard final answer.
+
+**Reasoning models.** Advanced models engineered to execute multi-step logic and internal deliberation before answering complex math, coding, or logic tasks.
+*Why it matters in production:* the deliberation is billed as output tokens. A reasoning model can turn a 1,500-token answer into tens of thousands of generated tokens, so a workload-level latency and cost budget must be re-planned before I switch a route to one. This is the hidden cost behind the workload-aware model routing described in [Sample Resume](/sample-resume).
+
+**Mixture of experts (MoE).** An architecture that routes specific tasks to specialized sub-networks within a larger model, improving speed and efficiency.
+*Why it matters in production:* only a fraction of parameters activate per token, which is how a very large model serves at a modest per-token price. It also means total parameter memory and inference compute are separate sizing problems — I can be bandwidth-bound on weights and still have spare FLOPs.
+
+## Retrieval and context
+
+Everything here exists because the model's knowledge is frozen and mine is not.
+
+**Retrieval-augmented generation (RAG).** A method that lets an LLM pull fresh facts from external databases before answering, reducing the need to retrain the model.
+*Why it matters in production:* it converts model dependency into an infrastructure dependency — an index with freshness, permissions, and recall characteristics I now own. Full argument in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer), mechanics in [RAGs](/rags) and [Complete RAG tutorial](/complete-rag-tutorial).
+
+**Embeddings and vector databases.** Numerical vectors that capture semantic meaning, stored in specialized vector databases to enable fast similarity searches.
+*Why it matters in production:* dimensionality is a RAM bill. A 768-dimension float32 vector is `768 × 4 = 3,072 bytes`, so 100M of them is 307 GB before any index overhead. The arithmetic and the multipliers are in [Data size estimation](/data-size-estimation).
+
+**Chain-of-thought (CoT).** A prompting technique that encourages the model to write out its step-by-step reasoning process to solve hard problems.
+*Why it matters in production:* it makes intermediate logic inspectable, which helps debugging, and it inflates output tokens — the expensive direction of the bill. I also never show raw chain-of-thought to end users; it leaks reasoning that can contain policy contradictions or retrieved private text.
+
+**KV cache.** A memory optimization technique used during inference to store previous key-value calculations and speed up response generation.
+*Why it matters in production:* it is the actual GPU constraint behind long-context latency. At 10M tokens the cache becomes a memory bottleneck and generation crawls, as measured in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer). Sharing it across users is the entire mechanism of [Caching LLM Chats to Quickly Answer User Queries Without RAG](/caching-llm-chats-to-quick-answer-user-query-without-rag).
+
+**Quantization.** A process that shrinks model size and memory usage by lowering the precision of its numerical weights.
+*Why it matters in production:* it buys capacity with accuracy I have to measure. Weights and vectors both shrink roughly linearly with bits per value — 4x less memory from fp32 to int8 — and the cost is a recall or quality loss that only shows up in evaluation, never in a smoke test.
+
+## Systems and orchestration
+
+These terms describe the layer around the model, which is where most production incidents happen.
+
+**Agentic AI.** Autonomous AI systems designed to plan, use tools, and execute multi-step workflows toward a specific goal without constant human prodding.
+*Why it matters in production:* an agent turns a single model call into N calls with unbounded N. I need a step budget, a timeout, and a circuit breaker before I need a cleverer prompt; the loop and its failure modes are what [What to Expect in FDE GenAI Roles](/what-to-expect-in-fde-gen-ai-roles) expects a candidate to teach.
+
+**Model Context Protocol (MCP).** An open standard that simplifies how AI models securely connect to external tools, data sources, and software.
+*Why it matters in production:* it moves the integration surface from "one bespoke function schema per model vendor" to a shared tool contract, which is what lets a tool be reused across agents. The security consequence is real: every registered tool is a callable capability with its own blast radius, and it inherits the prompt-injection problem below.
+
+**Guardrails.** Safety and compliance filters placed around an LLM to block toxic language, personal data leaks, and off-topic or illegal responses.
+*Why it matters in production:* they sit on the request path, so they add latency and can reject valid traffic. Guardrails without a measured false-block rate silently degrade the product; I want both the block rate and the PII-recall rate tracked as SLOs, not vibes.
+
+**LLM-as-a-judge.** Using a powerful secondary AI model to evaluate, score, and test the outputs of another model automatically.
+*Why it matters in production:* it is the only way to regression-test generation quality at CI speed, since deterministic asserts cannot grade fluency or groundedness. Its failure modes are well documented — position bias toward the first candidate, verbosity bias, and self-preference for the judge's own style — so I calibrate the judge against a small human-labelled set instead of trusting the score.
+
+## How the terms compose into one bill
+
+The useful part of a glossary is not the definitions, it is knowing which knobs interact. A single production request touches most of the list above:
+
+| Stage | Terms in play | The number I control |
+| :-- | :-- | :-- |
+| Input | Transformers, multimodal, KV cache | Prefill tokens, and therefore TTFT |
+| Model choice | SLMs, reasoning models, MoE | Cost per token and quality floor |
+| Context sourcing | RAG, embeddings and vector DBs, CoT | Retrieved tokens per prompt |
+| Memory budget | Quantization, KV cache | GPU or RAM per vector and per token |
+| Orchestration | Agentic AI, MCP | Number of model and tool calls per request |
+| Trust | Guardrails, LLM-as-a-judge | Blocked-rate, groundedness score, regression gate |
+
+Read that table as a cost model. If I want latency down, the levers are prefill length and call count, not "a faster GPU" — the same conclusion the cached-context arithmetic reaches in [Caching LLM Chats to Quickly Answer User Queries Without RAG](/caching-llm-chats-to-quick-answer-user-query-without-rag). If I want cost per query down, the lever is retrieved tokens per prompt, which is a chunking and top-k decision, not a pricing negotiation.
+
+<Note>
+Three of these terms — RAG, agentic AI, and MCP — are the ones I am asked to explain from first principles most often in interviews. If I cannot explain why each exists before naming it, I do not understand it well enough to design with it, which is exactly the criterion the FDE teaching round applies.
+</Note>
+
+<Tip>
+Where to go deeper: [RAGs](/rags) for retrieval architecture, [Complete RAG tutorial](/complete-rag-tutorial) for a runnable end-to-end pipeline, [Scalable vector database](/scalablae-vector-database) for ANN and quantization at billions of vectors, [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) for the long-context-versus-retrieval argument, and [What to Expect in FDE GenAI Roles](/what-to-expect-in-fde-gen-ai-roles) for how this vocabulary is actually probed in a loop.
+</Tip>

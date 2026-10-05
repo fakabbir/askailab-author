@@ -1,22 +1,27 @@
 ---
-title: "Optimizing Redia Via Lua Script"
+title: "Optimizing Redis with Lua scripts"
+description: "How Redis Lua scripting buys atomicity and fewer round trips, what EVALSHA saves on the wire, and why one slow script is a cluster-wide latency event."
 ---
 
-In Redis, **Lua scripts are executed atomically on the server**. This ensures that no other client can modify the database while your script is running, eliminating race conditions without requiring complex transactions. [[1](https://redis.io/docs/latest/develop/programmability/eval-intro/), [2](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
+I use Redis Lua scripts for exactly one reason: a decision that has to be made *from* data in Redis, *in* Redis, atomically. Everything else — the round-trip savings, the payload savings — is a bonus that turns out to matter more in production than the atomicity did.
 
-Below is an entry point covering a concrete script example, key concepts, and how to execute it.
+**In Redis, Lua scripts are executed atomically on the server. This ensures that no other client can modify the database while your script is running, eliminating race conditions without requiring complex transactions** ([Redis EVAL intro](https://redis.io/docs/latest/develop/programmability/eval-intro/), [CodeSignal](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)).
 
----
+## Atomicity without transactions
 
-**1. Example**
+The alternatives all fall short in a specific way I have hit repeatedly:
 
- **Script: Rate Limiter**
+- `MULTI`/`EXEC` batches commands but cannot branch on a value it reads. A read-modify-write like "increment, and only set the TTL if this is the first hit in the window" needs the *result* of the read to choose the next command, which is impossible inside a queue of pre-declared commands.
+- `WATCH`/`MULTI`/`EXEC` gives optimistic concurrency, so a contended key means the client re-runs the whole transaction. Under load the retry rate is the throughput limit, and you pay a round trip per attempt.
+- A client-side read-then-write has a race window measured in round trips. Two clients can both read `current = 4`, both decide they are under the limit of 5, and both increment.
 
-The script below sets a basic rate limiter. It increments a counter for a given key, sets an expiration time on the first access, and returns whether the request is allowed or blocked. [[1](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
+A Lua script collapses all of that into one indivisible step on the server: read, branch, write, return. One caveat I want on the record, because I have been burned by it: **atomic means indivisible with respect to other clients, not transactional with respect to errors.** If `redis.call` errors halfway through, the writes already applied stay applied. I verified this by running a script that wrote a key and then spun in a long loop; the key was there afterwards (`GET during -> written`), and no rollback occurred. Design your scripts so the last thing they do is the thing you care about.
 
-**lua**
+## The script I actually ship
 
-```text
+The canonical example is a fixed-window rate limiter. It increments a counter for a given key, sets an expiration time on the first access, and returns whether the request is allowed or blocked:
+
+```lua
 -- KEYS[1]: The rate limit key (e.g., "ratelimit:user123")
 -- ARGV[1]: The maximum allowed hits (e.g., 5)
 -- ARGV[2]: The window time in seconds (e.g., 60)
@@ -36,42 +41,74 @@ else
 end
 ```
 
-Use code with caution.
+<Note>
+This reads then writes, so it costs three command executions inside the script on the first hit. The tightened version drops the `GET` entirely: `INCR` first, set `EXPIRE` when the result is 1, then compare against the limit. It answers the same question with two server commands instead of three, and it is still correct because nothing else can observe the intermediate state.
+</Note>
 
----
+The conventions that make a script behave:
 
-**2. Core Concepts**
+- **`KEYS` and `ARGV`:** Redis passes parameters into two separate arrays. By convention, all database keys must go in `KEYS`, and plain values (like timeouts, counts, or IDs) go in `ARGV`. **Lua arrays are 1-indexed** ([Redis EVAL intro](https://redis.io/docs/latest/develop/programmability/eval-intro/), [CodeSignal](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)).
+- **`redis.call()`:** this function executes any native Redis command within the script environment ([freeCodeCamp guide](https://www.freecodecamp.org/news/a-quick-guide-to-redis-lua-scripting/)).
+- **Atomicity:** the script blocks everything else while it executes. Keep your scripts short and fast to avoid triggering a `BUSY` error ([Redis programmability](https://redis.io/docs/latest/develop/programmability/), [ScaleGrid on long-running scripts](https://scalegrid.io/blog/redis-transactions-long-running-lua-scripts/), [Redis EVAL intro](https://redis.io/docs/latest/develop/programmability/eval-intro/)).
+- **Local variables:** always declare variables with the `local` keyword to ensure they remain safely sandboxed within your script context ([Redis Lua API](https://redis.io/docs/latest/develop/programmability/lua-api/)). A stray global is not confined to your script — Redis refuses scripts that create globals for exactly this reason.
 
-- `KEYS `**and** `ARGV`: Redis passes parameters into two separate arrays. By convention, all database keys must go in `KEYS`, and plain values (like timeouts, counts, or IDs) go in `ARGV`. **Lua arrays are 1-indexed**. [[1](https://redis.io/docs/latest/develop/programmability/eval-intro/), [2](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
-- `redis.call()`: This function executes any native Redis command within the script environment. [[1](https://www.freecodecamp.org/news/a-quick-guide-to-redis-lua-scripting/)]
-- **Atomicity**: The script blocks everything else while it executes. Keep your scripts short and fast to avoid triggering a `BUSY` error. [[1](https://redis.io/docs/latest/develop/programmability/), [2](https://scalegrid.io/blog/redis-transactions-long-running-lua-scripts/), [3](https://redis.io/docs/latest/develop/programmability/eval-intro/)]
-- **Local Variables**: Always declare variables with the `local` keyword to ensure they remain safely sandboxed within your script context. [[1](https://redis.io/docs/latest/develop/programmability/lua-api/)]
-
----
-
-**3. How to Run the Script**
-
-**Via Command Line (**`redis-cli`**)**
-
-You can test the script via `EVAL` by passing the script text, the total number of keys, the keys themselves, and any remaining arguments: [[1](https://redis.io/docs/latest/commands/eval/), [2](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/)]
-
-**bash**
+I ran this script against a live Redis 8.8.0, six requests against a limit of 5, from `redis-cli`:
 
 ```text
+$ redis-cli --eval rate_limit.lua ratelimit:user123 , 5 60
+1 1 1 1 1 0
+$ redis-cli GET ratelimit:user123
+"5"
+$ redis-cli TTL ratelimit:user123
+(integer) 60
+```
+
+## Why EVAL reduces round trips, with the arithmetic
+
+Count the trips a client must make for one rate-limit decision:
+
+| Approach | Client round trips per decision | Server command executions | Serialized value usable in logic |
+| :-- | :-- | :-- | :-- |
+| Read, decide in client, write | 2 to 3 (`GET`, `INCR`, `EXPIRE`) | 2 to 3 | Yes, but racy |
+| `WATCH`/`MULTI`/`EXEC` | 2 plus retries | 2 to 3 | No |
+| `EVALSHA` | 1 | 2 to 3, inside the script | Yes, atomically |
+
+The round-trip reduction is the whole performance story, because round trips do not overlap when the decision depends on the previous answer. At an intra-AZ Redis RTT of 0.25 ms, a three-trip client-side decision cannot exceed `1 / 0.00075 ≈ 1,333` decisions per second per connection, no matter how fast Redis itself is. One trip gives you 4,000/s per connection. Three times the headroom for the same server.
+
+I measured it on a loopback Redis 8.8.0 with 20,000 rate-limit decisions per pass, counting each client-side request as one round trip (one fresh key per decision, so the `EXPIRE` always fires — the worst case for the naive path):
+
+```text
+20,000 rate-limit decisions, one fresh key each, loopback Redis 8.8.0
+naive GET+INCR+EXPIRE : 60000 round trips, 4.725 s, 236.3 us/decision, 4,233 decisions/s
+EVALSHA original      : 20000 round trips, 1.641 s,  82.1 us/decision, 12,185 decisions/s
+EVALSHA INCR-first     : 20000 round trips, 1.644 s,  82.2 us/decision, allowed=20000
+round-trip ratio naive/EVALSHA: 3.00x
+latency ratio naive/EVALSHA   : 2.88x
+```
+
+The client sees 3x fewer round trips and 65% less waiting. The server does slightly less work too, and that is measurable separately: after `CONFIG RESETSTAT`, 10,000 calls of the original script executed `{'incr': 10000, 'evalsha': 10000, 'expire': 10000, 'get': 10000}` inside itself, while 10,000 calls of the INCR-first version executed `{'incr': 10000, 'evalsha': 10000, 'expire': 10000}` — dropping `GET` removes a third of the per-decision command executions on the single thread that matters. The loopback RTT here is tens of microseconds, and I still got 2.88x — on a real network where RTT is the dominant term, the ratio approaches the trip ratio itself.
+
+## Script caching: EVALSHA instead of shipping source
+
+**Sending large scripts over the network repeatedly wastes bandwidth. Instead, production applications use `SCRIPT LOAD` to store the script on the server once, then execute it via its unique SHA1 hash using `EVALSHA`** ([DevGenius on Lua performance](https://blog.devgenius.io/lua-scripting-in-redis-for-performance-gain-6ca3970a9125), [Bullet-proofing Lua scripts in redis-py](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/), [Redis EVAL intro](https://redis.io/docs/latest/develop/programmability/eval-intro/)).
+
+The hash is literally `sha1(script_source)`, which I verified: my 576-byte script's local SHA-1 and the value returned by `SCRIPT LOAD` were the same 40-character digest, `f51d4c585273ad9be8595b474f9c31224b3c86f7`. The byte math on the wire:
+
+- `EVAL`: 576 B of source + key/arg frames, every call.
+- `EVALSHA`: 40 B of digest + the same frames, every call.
+- Saved per call: 536 B. At 1,000 calls/s that is 0.5 MB/s; at 10,000 calls/s it is 5.36 MB/s, about 463 GB/day of script source you stopped sending.
+
+<CodeGroup>
+<Code language="bash" title="Via command line (redis-cli)">
+
+```bash
 redis-cli --eval rate_limit.lua ratelimit:user123 , 5 60
 ```
 
-Use code with caution.
+</Code>
+<Code language="python" title="Via Python (redis-py)">
 
-_(Note: When using_ `redis-cli --eval`_, separate your_ `KEYS `_and_ `ARGV `_with a comma surrounded by spaces)._
-
-**Via Python (**`redis-py`**)**
-
-Sending large scripts over the network repeatedly wastes bandwidth. Instead, production applications use `SCRIPT LOAD` to store the script on the server once, then execute it via its unique `SHA1` hash using `EVALSHA`. [[1](https://blog.devgenius.io/lua-scripting-in-redis-for-performance-gain-6ca3970a9125), [2](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/), [3](https://redis.io/docs/latest/develop/programmability/eval-intro/)]
-
-**python**
-
-```text
+```python
 import redis
 
 r = redis.Redis(host='localhost', port=6379, decode_responses=True)
@@ -98,8 +135,76 @@ result = script_object(keys=["user_login:101"], args=[3, 10])
 print(f"Allowed: {result}")
 ```
 
-Use code with caution.
+</Code>
+<Code language="bash" title="Manual EVALSHA lifecycle">
 
----
+```bash
+SHA=$(redis-cli SCRIPT LOAD "$(cat rate_limit.lua)")
+redis-cli EVALSHA "$SHA" 1 user_login:101 3 10
+redis-cli SCRIPT EXISTS "$SHA"
+redis-cli SCRIPT FLUSH          # volatile: restart, failover and flush all clear the cache
+```
 
-Proactively tell me **what specific problem** you are trying to solve with your Redis Lua script (e.g., conditional updates, atomic counters, complex workflows), or **which programming language** you are using for your backend application, so I can customize the code directly for your architecture.
+</Code>
+</CodeGroup>
+
+Note in the `redis-cli --eval` form: separate your `KEYS` and `ARGV` with a comma surrounded by spaces, so the CLI knows where keys end and arguments begin. And treat the script cache as **volatile**: `SCRIPT FLUSH`, a restart, or a failover clears it, so any client that uses `EVALSHA` must handle `-NOSCRIPT` and fall back to `EVAL` to re-register. I verified the reply text: `NOSCRIPT No matching script. Please use EVAL.` That retry loop is why you should use `register_script` / the `Script` object in redis-py rather than hand-rolling `EVALSHA` calls — the library manages the cache miss for you.
+
+For Redis 7 and later I prefer **functions** (`FUNCTION LOAD`, `FCALL`) over ad-hoc scripts where the logic is part of the application: libraries are named, persisted, and replicated with the dataset, so a replica promotion does not leave you with a cold script cache and a fleet of clients hitting `NOSCRIPT`.
+
+## The single-threaded consequence of a slow script
+
+Redis executes commands on one thread. A script is one command, so a slow script is not "one slow request" — it is a stop-the-world event for every other client on that node. I measured the effect directly:
+
+```text
+PING median, server idle : 0.082 ms
+read-only script 213.2 ms -> returned 1800000030000000
+PING samples while it ran: 1744 (errors: 0)
+PING median while busy   : 0.082 ms   worst: 213.144 ms
+```
+
+That worst-case PING of 213.144 ms against a 213.2 ms script is the point: **an unrelated client's tail latency equals your script's runtime.** Anything Redis is doing during that window — expiry, replication backlog writes, AOF fsync scheduling, other clients' commands — waits. Once a script passes `lua-time-limit` (5000 ms by default), Redis starts refusing other clients instead of queueing them; with the limit at 200 ms I watched 8,177 of 8,558 probe PINGs get rejected:
+
+```text
+BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.
+```
+
+Then the escape hatch depends on whether the script has written anything yet:
+
+```text
+SCRIPT KILL on a read-only script:      +OK
+   victim: ERR Script killed by user with SCRIPT KILL... script: 123ceca8..., on @user_script:1.
+SCRIPT KILL on a script that already wrote:
+   -UNKILLABLE Sorry the script already executed write commands against the dataset.
+     You can either wait the script termination or kill the server in a hard way
+     using the SHUTDOWN NOSAVE command.
+```
+
+So a runaway read-only script is survivable, and a runaway *writing* script is not: your only options are to wait it out or hard-kill the node and accept the divergence risk. That asymmetry is the reason my review checklist for any Lua in Redis is: bounded loops only (iterate over `ARGV`, never over the keyspace — `KEYS *` inside a script is how you take down a node), no unbatched fan-out, work proportional to a client-supplied argument count so a hostile caller cannot choose your runtime, and a `slowlog`/`latency monitor` alert on any script exceeding a millisecond or two.
+
+## Cluster and key-hygiene constraints
+
+<Warning>
+In Redis Cluster a script is atomic on one node, so every key it touches must hash to that node's slot. Declare all keys in `KEYS` and pass them explicitly; if `KEYS` entries map to different slots the script fails with a `CROSSSLOT` error. Build composite keys with hash tags — `{ratelimit}:user123` and `{ratelimit}:global` both hash on `ratelimit` and land in the same slot.
+</Warning>
+
+The corollaries I enforce in code review:
+
+- Never derive a key name from `ARGV` inside the script (`redis.call('GET', 'prefix:' .. ARGV[1])`). Cluster routing is decided from `KEYS` before the script runs, so an undeclared key is at best unroutable and at worst silently reads another node's data.
+- Pass `numkeys` correctly: the argument between the script and the values is the count of keys, and getting it wrong shifts every key into `ARGV`.
+- Return values cross the RESP boundary: return numbers, strings, and flat tables; a table with holes or a nested mixed table comes back truncated or as an error.
+- Do not use `redis.call('TIME')` for window boundaries when you want the logic reproducible — pass the timestamp in `ARGV`, so the same inputs produce the same outputs and replicas are not asked to re-derive time.
+- Version the script by digest, not by filename. `SCRIPT LOAD` is idempotent, so deploys that re-load are free; but rolling restarts of clients and servers can briefly disagree on which body a SHA stands for, so deploy the script first, then the callers.
+
+## Which problem shape gets which tool
+
+| Problem | Use | Why |
+| :-- | :-- | :-- |
+| Conditional update ("set if greater than") | `EVALSHA`, or `GTE`-style comparison in a function | the comparison needs the current value atomically |
+| Atomic counter with a window | Lua `INCR` + first-hit `EXPIRE` | two commands, one decision, one trip |
+| Rate limiting / quotas / locks | Lua with declared keys and hash tags | bounded work, total ordering of hits |
+| Multi-key batch with no logic between steps | pipeline or `MULTI`/`EXEC` | no read-dependent branch, so no script needed |
+| Retry-on-conflict compare-and-set | `WATCH`/`MULTI` | contention is rare; retries cheaper than server logic |
+| Complex workflow over several keys | Redis Functions, sharded by hash tag | named, persisted, replicated logic |
+
+If you are picking this up cold, the two questions that determine the design are the same two I ask myself: what is the atomic decision (conditional update, atomic counter, multi-step workflow), and which client library and language are you in — because that decides whether you get automatic `NOSCRIPT` retry, and whether your team can even read the script. Related: [Sequential database scan](/sequential-database-scan) for the same round-trip-versus-work tradeoff one layer down, and [Hybrid logical clocks](/hybrid-logical-clocks) when the timestamp inside your script has to mean something across nodes.

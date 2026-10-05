@@ -1,40 +1,151 @@
 ---
-title: "vector clocks for CRDT"
+title: "Vector clocks for CRDTs"
+description: "How vector clocks establish happens-before and expose write conflicts, why their size is a problem in real clusters, and what dots and interval tree stamps trade away."
 ---
 
-[Vector clocks](https://algoroq.io/concepts/vector-clocks/) are data structures used in distributed systems to track causality and identify concurrent, conflicting updates without relying on physical wall-clock time.
+Vector clocks are the data structure I reach for when a system must *know* that two writes happened independently, rather than silently pick a winner. They are used in distributed systems to track causality and identify concurrent, conflicting updates without relying on physical wall-clock time ([algoroq](https://algoroq.io/concepts/vector-clocks/); the GeeksforGeeks reference entry and the Software Interviews Prep walkthrough on YouTube cover the same mechanics). The catch, and most of the interesting engineering, is that the price of that knowledge is proportional to the number of replicas — which is exactly what later designs (version vectors, dots, interval tree clocks) try not to pay.
 
-GeeksforGeeks +1
+## How vector clocks work
 
-How Vector Clocks Work
+The mechanics I implement, from the [System Design Academy](http://www.systemdesignacademy.com) overview and the sources above:
 
-- **Structure:** An array or map of logical counters, with one entry for each node or process in the system.
-- **Initialization:** All clock values start at zero for every node.
-- **Local Events:** A node increments its own counter in its vector when a local event or write occurs.
-- **Message Transmission:** A node attaches its entire vector clock when sending a message to another node.
-- **Message Reception:** Upon receiving a message, a node takes the element-wise maximum of its own vector and the incoming vector, then increments its own counter.
-  YouTube·Software Interviews Prep
+- **Structure:** an array or map of logical counters, with one entry for each node or process in the system.
+- **Initialization:** all clock values start at zero for every node.
+- **Local events:** a node increments its own counter in its vector when a local event or write occurs.
+- **Message transmission:** a node attaches its entire vector clock when sending a message to another node.
+- **Message reception:** upon receiving a message, a node takes the element-wise maximum of its own vector and the incoming vector, then increments its own counter.
 
-Causality and Conflict Detection
+That merge-then-increment order matters. The merge imports everything the sender knew; the increment makes this event strictly newer than anything this node has already stamped, so a replica never issues two identical stamps for different events.
 
-- **Happened-Before (V₁ ≤ V₂):** Event 1 causally precedes Event 2 if every element in V₁ is less than or equal to V₂, and at least one element is strictly smaller.
-  YouTube·Software Interviews Prep
-- **Concurrency / Conflict:** Two events are concurrent (neither happened before the other) if
-  V1≰V2cap V sub 1 is neither less than nor equal to cap V sub 2
+Cost per event: `O(N)` work and `O(N)` bytes, where `N` is the number of entries. Comparison is also `O(N)`. Nothing about that is expensive at three replicas and ruinous at three hundred, which is the whole plot of this page.
 
-  𝑉1≰𝑉2
+## Happened-before, and the conflict signal
 
-   and
-  V2≰V1cap V sub 2 is neither less than nor equal to cap V sub 1
+- **Happened-before (`V₁ ≤ V₂`):** event 1 causally precedes event 2 if every element in `V₁` is less than or equal to `V₂`, and at least one element is strictly smaller ([System Design Academy](http://www.systemdesignacademy.com)).
+- **Concurrency / conflict:** two events are concurrent — neither happened before the other — if `V1 ≰ V2` and `V2 ≰ V1`, signaling a potential write conflict that requires merging (Medium's vector-clock explainers and [algoroq](https://algoroq.io/concepts/vector-clocks/) both state this form).
 
-  𝑉2≰𝑉1
+I want to be precise about the third case, because it is where bugs hide: two identical vectors are neither `≤` nor concurrent. Identical stamps mean the same event seen twice — a duplicate delivery, which is what makes idempotent merging safe.
 
-  , signaling a potential write conflict that requires merging.
-  Medium +1
+So a vector clock gives you three outcomes per comparison, not two: `before`, `after`, or `concurrent` (plus `equal`). A scalar timestamp — wall clock, [Lamport, or an HLC](/hybrid-logical-clocks) — gives you only "greater" and "less". That single bit of expressiveness is the reason CRDT and Dynamo-style systems carry vectors at all.
 
-Relationship with CRDTs
+## The three-replica trace
 
-- **Role in [CRDTs](https://adamwulf.me/2021/05/distributed-clocks-and-crdts/):** While raw vector clocks detect conflicts and pass them to applications or return "siblings" (like in DynamoDB or Riak), state-based or operation-based Conflict-free Replicated Data Types embed causal tracking directly into mathematical lattices.
-  [www.systemdesignacademy.com](http://www.systemdesignacademy.com) +2
-- **Evolution:** Advanced CRDT designs often use fine-grained metadata like version vectors, dotted version vectors (DVVs), or per-element dots instead of a monolithic vector clock to reduce memory overhead and avoid unbounded size growth in large clusters.
-  Matthew Weidner +1
+Here is the worked example I use whenever these rules feel slippery. Replicas `A`, `B`, `C`; stamps are `(A, B, C)`; a write to key `x` at each step. The relation column compares the new stamp to the ones already in play.
+
+| Step | Actor | Event | VA | VB | VC | What it proves |
+| :-- | :-- | :-- | :-- | :-- | :-- | :-- |
+| 1 | A | write `x = 1` | 1 | 0 | 0 | A's first stamp |
+| 2 | B | write `x = 2` | 0 | 1 | 0 | `x=1` vs `x=2` concurrent -> siblings |
+| 3 | C | write `x = 3` | 0 | 0 | 1 | concurrent with both `x=1` and `x=2` |
+| 4 | A | receive B's stamp, tick | 2 | 1 | 0 | A's new version dominates `x=1` and `x=2` |
+| 5 | B | receive C's stamp, tick | 0 | 2 | 1 | B is still concurrent with A's merged version |
+| 6 | C | receive A's stamp, tick | 2 | 1 | 2 | C dominates `x=1`, `x=2`, `x=3`; still concurrent with B |
+| 7 | A | receive B's stamp, tick | 3 | 2 | 1 | A now dominates all three original writes |
+| 8 | B | receive C's stamp, tick | 2 | 3 | 2 | concurrent with A's step-7 stamp |
+| 9 | C | receive A's stamp, tick | 3 | 2 | 3 | C's stamp dominates A's; B's remains concurrent |
+
+I ran this trace to confirm the numbers. The reading I want you to take from it:
+
+- After step 3 the register has three live versions, and *nothing* in the system can tell you which is "the" write. Any single-number tie-break is a policy choice you are making on behalf of the user.
+- Step 4 is the interesting one. A merges B's `(0,1,0)` into its own `(1,0,0)` to get `(1,1,0)`, then increments to `(2,1,0)`. That stamp dominates both `x=1` and `x=2`, so A is allowed to fold those two siblings into one version: the merge is not "pick one", it is "produce something that is causally after both".
+- Steps 5 and 6 show why convergence needs gossip rounds, not luck: B and C are concurrently advancing, and no ordering of their stamps exists. Only when a replica has *heard from everyone* can it collapse the sibling set.
+- By step 9 the vector `(3,2,3)` at C dominates every original write, so the sibling set for `x` is empty and all replicas agree — that is convergence, and it came from the join being a max, which is associative, commutative and idempotent.
+
+## The relationship with CRDTs
+
+**While raw vector clocks detect conflicts and pass them to applications or return "siblings" (like in DynamoDB or Riak), state-based or operation-based Conflict-free Replicated Data Types embed causal tracking directly into mathematical lattices** ([System Design Academy](http://www.systemdesignacademy.com), [Adam Wulf on distributed clocks and CRDTs](https://adamwulf.me/2021/05/distributed-clocks-and-crdts/)).
+
+That sentence is the hinge of the whole topic, so let me unpack what each side actually needs from the stamp.
+
+<Tabs>
+<Tab title="LWW register">
+
+A last-write-wins register wants a *total* order so the merge is a one-line `max`. It cannot represent "two versions coexist". If you hand an LWW register a vector clock, you have thrown away the only thing the vector gave you, because you must then break ties arbitrarily (usually by node id) to produce the total order — at which point you could have used an 8-byte [HLC](/hybrid-logical-clocks) instead of an `O(N)` vector and lost nothing. LWW is the right choice when the concurrent write is genuinely rare and a lost update is acceptable; it is the wrong choice for a collaborative text field, a shopping cart, or anything a human will notice.
+
+</Tab>
+<Tab title="True CRDT merge">
+
+For a state-based CRDT the merge is the lattice join, and the requirement on the stamp is much weaker than "total order": it must be *monotone* (the join never decreases it), *comparable*, and *idempotent* under re-delivery. This is where the vector clock stops being metadata and starts being the data:
+
+- A `G-Counter` **is** a vector of per-replica counters. Its join is the element-wise maximum, which is precisely the vector-clock merge rule.
+- A `PN-Counter` adds a second such vector for decrements.
+- An `OR-Set` needs per-element unique tags, which is what dots are (below).
+- An `MV-Register` keeps the set of maximal versions and their values — the sibling model, but with the merge done inside the type instead of in the client.
+
+So: an LWW register needs the timestamp to *decide a winner*; a true CRDT needs it to *describe the state's causal past* so that any replica can compute the same join.
+
+</Tab>
+</Tabs>
+
+## The membership and size problem
+
+A vector clock's cost is one entry per node, and I cannot stress how quickly this becomes the dominant term in a design review.
+
+| Replicas (`N`) | int64 bytes per stamp | 1M keys, 1 version | 10M keys, 3 live versions |
+| :-- | :-- | :-- | :-- |
+| 3 | 24 B | 24 MB | 0.2 GB |
+| 12 | 96 B | 96 MB | 1.0 GB |
+| 64 | 512 B | 512 MB | 5.1 GB |
+| 128 | 1,024 B | 1.0 GB | 10.2 GB |
+| 300 | 2,400 B | 2.4 GB | 24 GB |
+
+The multiply-by-3 column is the one people forget: conflict detection means you store *sibling versions*, so memory scales with keys × live versions × cluster size. Compare with the eight-byte HLC stamp in [Hybrid logical clocks](/hybrid-logical-clocks), which is 64x smaller at 64 nodes and does not grow at all.
+
+The size problem has three distinct faces, and each has a different fix:
+
+1. **Membership churn.** When a node joins, every vector in the system gains an entry; when it leaves, comparing a stamp that has 40 entries against one that has 39 is undefined unless you decide on a convention. I treat a missing entry as zero, which lets me prune, but pruning is only sound for entries I can prove no future event can reference.
+2. **Unbounded counter spread.** Nodes that have been up longest carry large counters, and long-lived stamps grow in *value* (varint size) as well as in *length*.
+3. **Per-message payload.** Attaching the entire vector to every message is `O(N)` wire cost per hop; at 64 nodes and 100k ops/s that is tens of MB/s just in stamps.
+
+Practical mitigations I have used: sparse maps that omit zeros (works when the cluster is large but each key is touched by a few replicas), run-length or varint encoding, delta/summary clocks that keep only the differences against a shared base, and pruning against a "stable" watermark — an entry can be dropped once every replica has acknowledged the events it contains. The last one is where dot versions come from.
+
+## Dots, DVVs and interval tree stamps
+
+**Advanced CRDT designs often use fine-grained metadata like version vectors, dotted version vectors (DVVs), or per-element dots instead of a monolithic vector clock to reduce memory overhead and avoid unbounded size growth in large clusters** (Matthew Weidner's notes on vector clocks and CRDTs, [Adam Wulf](https://adamwulf.me/2021/05/distributed-clocks-and-crdts/)).
+
+What each buys, in the order I would adopt them:
+
+<Steps>
+<Step title="Version vectors">
+
+The same shape as a vector clock but attached to a *replica's state* rather than to an event, which lets you compare states instead of events and lets the type own the merge. No asymptotic win, but it moves the clock from the message envelope into the value, which is what makes pruning and serialisation tractable.
+
+</Step>
+<Step title="Dotted version vectors (DVV) and per-element dots">
+
+Split the metadata into two parts: a version vector `N` of *stable* counters, plus at most one *dot* `(replica, counter)` for the causal successor currently in flight. The invariant I rely on is that a replica never has more than one provisional dot at a time, so the metadata is one vector plus one pair, not one vector per live version.
+
+Dots solve the problem that broke plain vector clocks for operation-based CRDTs: when a replica has an op in flight and a *concurrent* op arrives, a vector clock cannot express "these two are the same causal generation, and the second one must not be delivered before the first one is known to be safe". Tagging every effect with its dot means a late concurrent op can be deferred until the pending dot either becomes stable (all peers acknowledged) or is explicitly rolled back. And because a dot becomes stable once acknowledged, dots are *prunable by definition* — that is the bound on growth that a monolithic vector clock never gives you.
+
+Cost: I must store, per dot, the set of effects it produced (a dot store), and I must never reuse a `(replica, counter)` pair across restarts. That means the counter goes on disk before the effects do.
+
+</Step>
+<Step title="Interval tree clocks and interval stamps">
+
+Change the domain instead of the counter set. A causal stamp is a set of *intervals* over an ordered domain that starts as one whole interval `[0, 1]`; on a local event you split your interval into two pieces, keeping one as the new stamp, and on a receive you take the union of interval sets. The memory is constant in the number of nodes and grows only with events that are still "live" in the stamp, so it is the design I reach for when the cluster size is the problem rather than the churn — and the reason it is attractive for CRDTs is that union is exactly a join-semilattice, so it composes with state-based merging.
+
+The trade: intervals fragment, so stamps need periodic *defragmentation* (merging adjacent intervals), comparison is no longer a cheap lexicographic scan of a dense array, and "which process is this?" is not directly recoverable from the stamp the way a vector index tells you. I treat ITC as the answer to "we have thousands of replicas", not as a drop-in for "we have twelve".
+
+</Step>
+</Steps>
+
+## Failure modes I design around
+
+<Warning>
+**Never resolve a concurrent pair by mutating state in place.** The moment you overwrite a sibling version because "the vector looks bigger", you have rebuilt an LWW register with `O(N)` metadata and lost the update for free.
+</Warning>
+
+<Tip>
+**Test the three-way relation, not the boolean.** Unit tests that assert `causally_before(a, b) == False` pass for both "after" and "concurrent". I assert on an explicit `before | after | equal | concurrent` enum; most vector-clock bugs I have shipped-shaped were a caller treating `not before` as `after`.
+</Tip>
+
+Other things that bite:
+
+- **Node identity reuse.** A restarted replica that inherits another node's counter position creates two events with the same stamp, which silently compares as `equal` and gets deduplicated — a lost write.
+- **Sibling explosion.** Under a long partition, live versions per key grow with the number of replicas writing; `3 × N` bytes per key becomes the memory problem again, and clients that never resolve siblings make it permanent.
+- **Pruning above the watermark.** Trim an entry that has not been acknowledged by everyone and you can produce a stamp that looks strictly newer than an event that already happened.
+- **Mixing clocks in one type.** Some fields stamped with wall time and some with vectors will not compare; pick one causal order per data structure and convert at the boundary.
+
+## What I actually pick
+
+For a three-to-twelve node replicated service where writes to the same key rarely overlap: an HLC per field, siblings only on the few types that need them, and [atomic merge logic pushed into the datastore](/optimizing-redia-via-lua-script) when the merge has to be a single indivisible step. For collaborative editing, offline clients, or anything where "both writes must survive" is a product requirement: dots, and specifically a DVV-shaped metadata layout, because it is the only scheme here whose size is bounded by *live* causality rather than by cluster membership. Vector clocks stay in my toolkit as the reference semantics — the definition every other stamp has to be able to emulate.

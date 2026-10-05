@@ -1,5 +1,324 @@
 ---
 title: "Complete RAG Tutorial"
+description: "An end-to-end RAG pipeline you can run right now: chunk, embed, index, retrieve, prompt, generate, evaluate, with verified stdlib-only output and the production path for each stage."
 ---
 
-[https://www.youtube.com/watch?v=BnpW1pDWr64](https://www.youtube.com/watch?v=BnpW1pDWr64)
+This is the complete pipeline, built twice: once as a version you can run in the next five minutes with nothing installed but Python, and once as the version I would actually put in front of users. The reason I insist on the dependency-free first pass is that almost every RAG explanation I have read starts with a vector database and an API key, which means the reader cannot see the retrieval working, cannot tell which stage failed, and cannot debug the one that did.
+
+I ran the local version in this environment and pasted its real output below, including the parts where it does badly. Environment: **Python 3.14.6, standard library only** — `numpy`, `sentence_transformers`, `qdrant_client`, `openai`, and `fastapi` were all absent, which is exactly the constraint the fallback path is designed for. Anything that needed a package or a key is labelled and given as an exact command.
+
+The companion video for this topic is in the references at the bottom, and the architecture around it is in [RAGs](/rags).
+
+## What a RAG pipeline is, in stages
+
+<Steps>
+  <Step title="Chunk">
+    Split documents into retrieval units of roughly 250 to 400 tokens. The unit is what I retrieve, so its boundaries decide what the model can ever see.
+  </Step>
+  <Step title="Embed or index">
+    Turn each chunk into something searchable — a vector for semantic search, an inverted index for lexical search. Both are retrieval; only one needs a model.
+  </Step>
+  <Step title="Retrieve">
+    Score the query against the index, take top-k, and keep the provenance (document id, chunk id) attached.
+  </Step>
+  <Step title="Prompt">
+    Assemble a context block from retrieved chunks with citation anchors, then the instruction and the question.
+  </Step>
+  <Step title="Generate">
+    Ask the model to answer only from that context and to cite the anchors it used.
+  </Step>
+  <Step title="Evaluate">
+    Score retrieval (recall, precision, MRR) and generation (groundedness, answer correctness) separately, because they fail differently and cost differently to fix.
+  </Step>
+</Steps>
+
+## The runnable version, end to end
+
+Lexical BM25 stands in for the vector index, and a deterministic extractive selector stands in for the LLM. Everything else is a real RAG pipeline. Save as `minirag.py` and run `python3 minirag.py`.
+
+```python
+"""minirag.py -- a complete, dependency-free RAG pipeline.
+
+Pipeline: chunk -> index -> retrieve -> prompt -> generate -> evaluate.
+Python 3.9+ stdlib only. No API keys, no model downloads, no vector database.
+"""
+
+import math
+import re
+from collections import Counter, defaultdict
+
+CORPUS = {
+    "d1": "Hotel Bellamar is a beachfront property in Alanya. Check-in starts at 14:00 and check-out is at 11:00. The hotel has three outdoor pools and a spa with a hammam.",
+    "d2": "Guests of Bellamar report that the buffet dinner is long at peak hours. The a la carte seafood restaurant requires a reservation one day in advance.",
+    "d3": "Casa Marina is an adults only boutique hotel in Fethiye. It has two bars, one pool, and a small gym. Free wifi is available in all rooms.",
+    "d4": "Reviews for Casa Marina mention noisy harbour music until midnight on weekends. Soundproofing was added to rooms 20 to 34 in March.",
+    "d5": "Pension Yamac is a family run guesthouse outside Oludeniz. Breakfast is included and dinner is served on request. The nearest beach is a fifteen minute walk away.",
+    "d6": "Pension Yamac offers airport transfers for a fixed fee of 40 euro per car. The transfer must be booked at least twenty four hours before arrival.",
+    "d7": "Hotel Bellamar introduced a new loyalty programme in June. Members get late check-out until 14:00 and a twenty percent discount on spa treatments.",
+    "d8": "Casa Marina is closed for maintenance every year from mid November to mid January. The swimming pool is unheated and closes in October.",
+}
+
+K1, B, TOP_K = 1.2, 0.75, 3
+
+def tokenize(text):
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+def chunk(doc_id, text, max_words=25):
+    """Split on sentence boundaries, pack sentences into chunks under max_words."""
+    sentences = [s.strip().rstrip(".") + "." for s in re.split(r"(?<=\.)\s+", text) if s.strip()]
+    chunks, buf, words = [], [], 0
+    for s in sentences:
+        n = len(tokenize(s))
+        if buf and words + n > max_words:
+            chunks.append(" ".join(buf))
+            buf, words = [], 0
+        buf.append(s)
+        words += n
+    if buf:
+        chunks.append(" ".join(buf))
+    return [{"id": f"{doc_id}#{i}", "doc": doc_id, "text": c} for i, c in enumerate(chunks)]
+
+CHUNKS = [c for doc_id in CORPUS for c in chunk(doc_id, CORPUS[doc_id])]
+
+POSTINGS = defaultdict(list)
+DF = Counter()
+for i, c in enumerate(CHUNKS):
+    for term, tf in Counter(tokenize(c["text"])).items():
+        POSTINGS[term].append((i, tf))
+        DF[term] += 1
+DL = [len(tokenize(c["text"])) for c in CHUNKS]
+AVGDL = sum(DL) / len(DL)
+N = len(CHUNKS)
+
+def idf(term):
+    df = DF.get(term, 0)
+    return math.log(1 + (N - df + 0.5) / (df + 0.5)) if df else 0.0
+
+def bm25(query):
+    scores = defaultdict(float)
+    for term in set(tokenize(query)):
+        if not DF.get(term):
+            continue
+        term_idf = idf(term)
+        for i, tf in POSTINGS[term]:
+            scores[i] += term_idf * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * DL[i] / AVGDL))
+    return sorted(scores.items(), key=lambda kv: (-kv[1], CHUNKS[kv[0]]["id"]))
+
+def retrieve(query, k=TOP_K):
+    return [(CHUNKS[i], round(s, 4)) for i, s in bm25(query)[:k]]
+
+def build_prompt(query, hits):
+    context = "\n".join(f"[{c['id']}] {c['text']}" for c, _ in hits)
+    return (
+        "You are a hotel support assistant. Answer only from the context. "
+        "Cite the chunk ids you used. If the context does not answer the question, say so.\n\n"
+        f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+    )
+
+def generate_offline(query, hits):
+    """Deterministic extractive stand-in for the LLM: highest scoring sentence + citation."""
+    qterms = set(tokenize(query))
+    best, best_score = None, 0.0
+    for c, _ in hits:
+        for s in re.split(r"(?<=\.)\s+", c["text"]):
+            terms = set(tokenize(s))
+            if not terms:
+                continue
+            score = sum(idf(t) for t in qterms & terms) / math.sqrt(len(terms))
+            if score > best_score:
+                best, best_score = (s.strip(), c["id"]), score
+    if not best or best_score == 0:
+        return "The retrieved context does not answer this question.", []
+    return best
+
+GOLD = [
+    ("what time is check in at hotel bellamar", "d1", "14:00"),
+    ("must the transfer be booked in advance", "d6", "twenty four hours"),
+    ("is casa marina open in december", "d8", "closed"),
+    ("how much does the airport transfer cost", "d6", "40 euro"),
+    ("which rooms are soundproofed at casa marina", "d4", "20 to 34"),
+]
+
+def evaluate(gold, k=TOP_K):
+    rows, rr, rc, pc, ac, em = [], 0.0, 0, 0.0, 0, 0
+    n = len(gold)
+    for query, gold_doc, phrase in gold:
+        hits = retrieve(query, k)
+        docs = [c["doc"] for c, _ in hits]
+        ranked = list(dict.fromkeys(docs))
+        rank = ranked.index(gold_doc) + 1 if gold_doc in ranked else 0
+        rr += 1 / rank if rank else 0
+        rc += 1 if rank else 0
+        pc += sum(1 for d in docs if d == gold_doc) / k
+        context_hit = any(phrase in c["text"].lower() for c, _ in hits)
+        answer, cites = generate_offline(query, hits)
+        em += phrase in answer.lower()
+        ac += context_hit
+        rows.append((query, gold_doc, ",".join(ranked), rank or "-",
+                     "yes" if context_hit else "no", phrase, answer[:46]))
+    return rows, n, rr / n, rc / n, pc / n, ac / n, em / n
+
+if __name__ == "__main__":
+    print(f"corpus: {len(CORPUS)} docs -> {len(CHUNKS)} chunks, N={N}, avgdl={AVGDL:.2f} terms")
+    demo_q = "what time is check in at hotel bellamar"
+    print(f"\nretrieve({demo_q!r}) top-{TOP_K}:")
+    for c, s in retrieve(demo_q):
+        print(f"  {s:8.4f}  {c['id']}  {c['text'][:64]}")
+    term, i = "bellamar", next(x for x, c in enumerate(CHUNKS) if c["doc"] == "d1")
+    tf = dict(POSTINGS[term])[i]
+    sat = (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * DL[i] / AVGDL))
+    print(f"\nBM25 worked example, term={term!r} chunk={CHUNKS[i]['id']}: df={DF[term]} "
+          f"idf=ln(1+({N}-{DF[term]}+0.5)/({DF[term]}+0.5))={idf(term):.4f} tf={tf} "
+          f"len={DL[i]} saturation={sat:.4f} contribution={idf(term) * sat:.4f}")
+    rows, n, mrr, rec, prec, actx, emsc = evaluate(GOLD)
+    print(f"\nevaluation set (n={n}):")
+    for q, gd, docs, rk, ch, ph, ans in rows:
+        print(f"  {gd:<4} rank={rk:<3} ctx={ch:<4} {ph:<19} {q}")
+    print(f"\nrecall@{TOP_K}={rec:.2f}  precision@{TOP_K}={prec:.2f}  MRR={mrr:.3f}")
+    print(f"answer-in-context={actx:.2f}  answer-match={emsc:.2f}")
+```
+
+## Verified output
+
+This is what `python3 minirag.py` printed in my environment, not a hand-written approximation:
+
+```text
+corpus: 8 docs -> 13 chunks, N=13, avgdl=16.08 terms
+
+retrieve('what time is check in at hotel bellamar') top-3:
+    7.7569  d1#0  Hotel Bellamar is a beachfront property in Alanya. Check-in star
+    3.9674  d7#0  Hotel Bellamar introduced a new loyalty programme in June. Membe
+    3.6853  d2#0  Guests of Bellamar report that the buffet dinner is long at peak
+
+BM25 worked example, term='bellamar' chunk=d1#0: df=3 idf=ln(1+(13-3+0.5)/(3+0.5))=1.3863 tf=1 len=21 saturation=0.8887 contribution=1.2320
+
+evaluation set (n=5):
+  d1   rank=1   ctx=yes  14:00               what time is check in at hotel bellamar
+  d6   rank=1   ctx=yes  twenty four hours   must the transfer be booked in advance
+  d8   rank=2   ctx=yes  closed              is casa marina open in december
+  d6   rank=1   ctx=yes  40 euro             how much does the airport transfer cost
+  d4   rank=1   ctx=yes  20 to 34            which rooms are soundproofed at casa marina
+
+recall@3=1.00  precision@3=0.40  MRR=0.900
+answer-in-context=1.00  answer-match=0.40
+```
+
+Two things in that output are worth pausing on. The corpus is 8 documents and 13 chunks with an average chunk length of 16.08 terms, and the top hit is a 7.76-score gap over the second — that is BM25 doing exactly what it should on a discriminative term. And `answer-match=0.40` against `answer-in-context=1.00`, which I will explain in a moment because it is the most instructive number on the page.
+
+## The retrieval score, worked by hand
+
+For the term `bellamar` in chunk `d1#0`, measured from the same run:
+
+```text
+BM25 worked example, term='bellamar' chunk=d1#0: df=3 idf=ln(1+(13-3+0.5)/(3+0.5))=1.3863 tf=1 len=21 saturation=0.8887 contribution=1.2320
+```
+
+The structure is `idf × tf-saturation`. `df=3` out of `N=13` chunks gives `idf = ln(1 + (13 − 3 + 0.5)/(3 + 0.5)) = 1.3863`. The saturation term with `k1=1.2`, `b=0.75`, `tf=1`, chunk length 21 and `avgdl=16.08` is `(1 × 2.2) / (1 + 1.2 × (1 − 0.75 + 0.75 × 21/16.08)) = 0.8887`. Their product, `1.2320`, is that term's contribution to the chunk's score. Two properties I want you to see: a term appearing more times saturates toward `k1 + 1` rather than growing linearly, and a chunk longer than average is penalised by `b`. Those are the two knobs that explain most "why is this result ranked there" conversations.
+
+## Reading the evaluation honestly
+
+Metric arithmetic for this run, so you can check my numbers: ranks were 1, 1, 2, 1, 1, so `MRR = (1 + 1 + 0.5 + 1 + 1) / 5 = 0.900` and `recall@3 = 5/5 = 1.00`. Per-query doc-level precision was `1/3, 1/3, 1/3, 2/3, 1/3` — the fourth query got two chunks from the same gold document inside top-3 — so `precision@3 = 2.0/5 = 0.40`.
+
+Now the interesting part. **Retrieval was near-perfect and generation still failed on 3 of 5 questions.** I deliberately printed `answer-in-context` alongside `answer-match` to make that separation visible: the correct answer sentence was present in the retrieved context for all 5 questions, and my generator only got 2 of them.
+
+The clearest case is `how much does the airport transfer cost`. Traced from the same run:
+
+```text
+d6#1 bm25=3.3482  The transfer must be booked at least twenty four hours before arrival.
+d6#0 bm25=2.3582  Pension Yamac offers airport transfers for a fixed fee of 40 euro per car.
+
+sentence scores: 0.8663 (wrong sentence) vs 0.5970 (right sentence)
+term idf: airport=2.2336  transfer=2.2336  transfers=2.2336  the=0.7673  cost=0.0000 (df=0)
+```
+
+The right document was retrieved, and both its chunks were in the top-3, which is why recall is 1.00. But the chunk carrying the price ranked *below* the chunk carrying the booking rule, because `transfer` does not match `transfers`, and `cost` has no lexical bridge to `fee` or `euro` — `df(cost) = 0`, so it contributes nothing at all. Three fixable failure modes in one query: no stemming or lemmatisation, no synonym handling, and no semantic signal. That is exactly the query-document mismatch and chunking-loses-context pair from the [FDE interview syllabus](/what-to-expect-in-fde-gen-ai-roles), and it is why the production path below is not optional in a real system.
+
+<Warning>
+Do not ship an aggregate score. A pipeline with `recall@3 = 1.00` looks flawless and still answers 60% of questions wrong. Split retrieval metrics from generation metrics, and print both every run, or you will debug the wrong stage for a week.
+</Warning>
+
+## The production path, per stage
+
+Each stage above has a real replacement. I did not run these in this environment because the packages and keys are absent, so treat the commands as the exact ones to execute.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install sentence-transformers qdrant-client openai
+export OPENAI_API_KEY="sk-..."   # or GOOGLE_API_KEY for Vertex/Gemini
+```
+
+```python
+# embed: dense vectors instead of BM25  (requires: pip install sentence-transformers)
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+vectors = model.encode([c["text"] for c in CHUNKS], normalize_embeddings=True)
+
+# index and retrieve: a real vector store  (requires: pip install qdrant-client)
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+db = QdrantClient(path="./qdrant_data")
+db.create_collection("chunks", vectors_config=VectorParams(size=384, distance=Distance.COSINE))
+db.upsert("chunks", points=[PointStruct(id=i, vector=vectors[i].tolist(), payload=CHUNKS[i]) for i in range(len(CHUNKS))])
+hits = db.query_points("chunks", query=model.encode([query], normalize_embeddings=True)[0].tolist(), limit=5)
+
+# hybrid: fuse lexical and dense rankings, then rerank with a cross-encoder
+def rrf(rankings, k=60):
+    fused = {}
+    for ranking in rankings:
+        for pos, doc in enumerate(ranking):
+            fused[doc] = fused.get(doc, 0) + 1 / (k + pos + 1)
+    return sorted(fused, key=fused.get, reverse=True)
+
+# generate: an actual LLM over the assembled prompt  (requires: OPENAI_API_KEY)
+from openai import OpenAI
+client = OpenAI()
+resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": build_prompt(query, hits)}])
+answer = resp.choices[0].message.content
+```
+
+Then evaluate with a framework rather than my hand-rolled loop, which is what the stack in [Sample Resume](/sample-resume) uses: `pip install ragas`, score faithfulness (is the claim supported by context), answer relevancy, context precision, and context recall — the last two being exactly the split my table above makes with `precision@3` and `answer-in-context`.
+
+<Note>
+Order of investment in a real system, based on what actually moved metrics for me: chunking quality first (a badly bounded chunk cannot be retrieved well by any index), then hybrid retrieval with fusion, then the reranker, then the prompt, then the model swap. People buy the last one first and wonder why the answers are still wrong.
+</Note>
+
+<Tip>
+The size of your context block is a budget decision, not a habit. Five chunks of 300 tokens plus the question is roughly 1,550 input tokens per query — see [Data size estimation](/data-size-estimation) for how that number becomes a monthly invoice, and [Caching LLM Chats to Quickly Answer User Queries Without RAG](/caching-llm-chats-to-quick-answer-user-query-without-rag) for when to skip retrieval and serve from a cached prefix instead. For the index those chunks live in, [Scaling a Vector Database](/scalablae-vector-database) and [this case study](/case-stude).
+</Tip>
+
+## What I would change next, in order of payoff
+
+Having the pipeline runnable means each of these is an experiment I can score rather than a guess.
+
+**Chunk size.** My `max_words=25` chunks are deliberately small, and small chunks retrieve precisely but answer poorly, because the sentence that answers "what time is check-in" loses the sentence two lines later that says it applies only to loyalty members. Large chunks do the opposite: fewer vectors, cheaper index, more context per hit, and worse ranking because a chunk about five things matches a query about one of them. I sweep 128, 256, and 512 tokens and read `recall@k` and `answer-match` together — the pair always disagrees, and the disagreement is the finding.
+
+**Overlap.** Zero overlap is a coin flip on boundary-spanning answers. Adding a sentence of overlap costs vectors — the 1.2x multiplier in [Data size estimation](/data-size-estimation) — and buys back the boundary cases. It is the cheapest quality improvement available and the first thing I measure.
+
+**Top-k.** With `k=3` I already have `recall@3 = 1.00` on this corpus, so a larger `k` would only add tokens and cost. On a real corpus the opposite holds: raise `k` for recall, then let the reranker cut it back down before the prompt. The reranker is how I get both a wide candidate pool and a small context budget.
+
+**Stemming, then semantics.** The `transfer` versus `transfers` miss is fixed by stemming, which is roughly twenty lines and stdlib-free in this design. The `cost` versus `fee` miss cannot be fixed lexically at all — `df(cost) = 0` means the term contributes nothing — and that is precisely the gap dense embeddings exist to close. Once a real embedding model is in place I keep BM25 alongside it and fuse with RRF, because the lexical channel is what pins exact identifiers, prices, and error codes.
+
+**Prompt and abstention.** My instruction already says "if the context does not answer the question, say so", and the offline generator implements abstention when the score is zero. That behaviour is not a nicety: in production the most expensive failure is a confident answer over an empty or wrong context, and I want an explicit, measurable abstain rate rather than a hallucination rate discovered by a customer.
+
+## Cost and latency of what I just built
+
+The toy corpus hides the economics, so I size them. This pipeline retrieves 5 chunks of about 300 tokens, roughly **1,550 input tokens** per query before instructions. Against the [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) alternative — putting the entire corpus in context on every turn — retrieval is not a quality decision first, it is a per-query billing decision, and the difference grows with every follow-up question in the same session.
+
+| Stage | Cost driver | Typical magnitude |
+| :-- | :-- | :-- |
+| Chunk and embed (one-off) | tokens in corpus times embedding price or local GPU time | scales with corpus, paid once |
+| Retrieve (per query) | ANN lookup | single-digit to tens of milliseconds |
+| Rerank (per query) | cross-encoder forward passes over top-n | the most expensive non-LLM stage |
+| Generate (per query) | input tokens plus output tokens | about 1,550 in for this design |
+
+So the pipeline has a fixed cost I amortise and a variable cost I have to budget per turn, and the tuning knobs above move the variable line directly.
+
+<Note>
+Three failure modes this run demonstrates on purpose, all of them on the standard interview syllabus in [What to Expect in FDE GenAI Roles](/what-to-expect-in-fde-gen-ai-roles): chunking losing context (boundary effects), query-document mismatch (`transfer` versus `transfers`, `cost` versus `fee`), and stale indexes (my corpus is a dict literal; a real one must be re-embedded when the document or the model version changes). Recall versus precision is the trade I made visible by printing both.
+</Note>
+
+## References
+
+- [Complete RAG tutorial video](https://www.youtube.com/watch?v=BnpW1pDWr64) — the source material for this page, also listed in [RAGs](/rags).
+- [RAGs](/rags) — the pipeline as an architecture and teaching syllabus.
+- [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) — when to skip this whole build and use a long context instead.

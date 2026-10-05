@@ -1,144 +1,83 @@
 ---
 title: "Sequential Database Scan"
+description: "How PostgreSQL decides between a sequential scan and an index scan under LIMIT, what each plan shape costs per page and per tuple, and the mitigations that actually hold."
 ---
 
-limit scanning postgres
+My starting note on this was "limit scanning postgres", and the honest summary is short: a `LIMIT` does not make a scan cheap unless the plan can *reach* the first rows without touching the rest of the table. Everything below is me working out when that is true, what it costs in pages and tuples when it is not, and how I fix the cases where the planner gets tricked.
 
-PostgreSQL optimizes queries with a `LIMIT` clause by allowing execution plans (like Index Scans) to return early once the row count is satisfied, avoiding unnecessary full-table scans. [[1](https://www.youtube.com/watch?v=4HEdl5-tu0k&t=285), [2](https://pganalyze.com/blog/5mins-postgres-limited-count)]
+## The mechanism: a Limit node is a short-circuit
 
-**How LIMIT Affects Scanning**
+**PostgreSQL optimizes queries with a `LIMIT` clause by allowing execution plans (like Index Scans) to return early once the row count is satisfied, avoiding unnecessary full-table scans** ([video walkthrough](https://www.youtube.com/watch?v=4HEdl5-tu0k&t=285), [pganalyze](https://pganalyze.com/blog/5mins-postgres-limited-count)). When you look at a plan with `EXPLAIN`, you see a `Limit` node at the very top of the execution tree, and the node above it is told "stop when the count is satisfied".
 
-- **Early Stop Execution:** When a query uses a `LIMIT` combined with an index matching the sort or filter criteria, PostgreSQL stops reading from the index or table as soon as it reaches the specified number of rows. [[1](https://pganalyze.com/blog/5mins-postgres-limited-count), [2](https://www.youtube.com/watch?v=4HEdl5-tu0k&t=285)]
-- **Planner Cost Estimation:** The query planner (`EXPLAIN`) factors in the `LIMIT` value, reducing the estimated total cost of the node because it expects to process only a fraction of the total matching rows. [[1](https://www.postgresql.org/docs/current/using-explain.html)]
-- **Sequential vs. Index Scans:** If there is no `ORDER BY` clause, the planner might still choose a sequential scan if it calculates that reading the heap sequentially is cheaper than setting up an index scan for a small, unrestricted limit. [[1](https://stackoverflow.com/questions/8566931/index-not-used-when-limit-is-used-in-postgres)]
-- **Synchronized Scans:** Under concurrent sessions running identical sequential scans without an `LIMIT`/`ORDER` guarantee, a query with a `LIMIT` can attach to an ongoing table scan from another session to minimize disk I/O. [[1](https://dev.to/franckpachot/postgresql-synchronized-sequential-scans-and-limit-without-an-order-by-1kia)]
+I call this the Limit short-circuit: instead of gathering all possible matching rows and then cutting off the extras, PostgreSQL stops the entire data-retrieval process the exact moment it finds enough rows to satisfy your limit.
 
-Would you like to share the **specific SQL query and its EXPLAIN ANALYZE output** so I can help you figure out why it is or isn't using an index scan?
+Three consequences I keep straight:
 
-DEV Community
+- **Early stop execution:** when a query uses a `LIMIT` combined with an index matching the sort or filter criteria, PostgreSQL stops reading from the index or table as soon as it reaches the specified number of rows ([pganalyze](https://pganalyze.com/blog/5mins-postgres-limited-count), [video walkthrough](https://www.youtube.com/watch?v=4HEdl5-tu0k&t=285)).
+- **Planner cost estimation:** the query planner (`EXPLAIN`) factors in the `LIMIT` value, reducing the estimated total cost of the node because it expects to process only a fraction of the total matching rows ([14.1 Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)).
+- **Sequential vs. index scans:** if there is no `ORDER BY` clause, the planner might still choose a sequential scan if it calculates that reading the heap sequentially is cheaper than setting up an index scan for a small, unrestricted limit ([Stack Overflow](https://stackoverflow.com/questions/8566931/index-not-used-when-limit-is-used-in-postgres)).
 
-**PostgreSQL Synchronized Sequential Scans and LIMIT ...**
+There is a fourth behaviour that surprises people: **synchronized scans**. Under concurrent sessions running identical sequential scans without an `LIMIT`/`ORDER` guarantee, a query with a `LIMIT` can attach to an ongoing table scan from another session to minimize disk I/O ([Franck Pachot](https://dev.to/franckpachot/postgresql-synchronized-sequential-scans-and-limit-without-an-order-by-1kia)). As the DEV Community note puts it, "An SQL statement lacking an ORDER BY clause does not ensure any specific output order. Typically, a sequential scan begins at the ..." — and with `synchronize_seqscans` on, that beginning may be somewhere in the middle of another backend's scan. I treat that as a correctness trap for any job that pages through rows assuming a stable starting point.
 
-An SQL statement lacking an ORDER BY clause does not ensure any specific output order. Typically, a sequential scan begins at the ...
+## Startup cost versus total cost
 
-Stack Overflow
+The planner compares plans using **Startup Cost** and **Total Cost**:
 
-**Index not used when LIMIT is used in postgres - Stack Overflow**
+- **Without a Limit:** the planner picks a strategy optimized to return *all* rows as fast as possible, which often favors a **Sequential Scan** or a **Hash Join**.
+- **With a Limit:** the planner calculates how much work it takes to get just those few rows, switching to a strategy optimized for the *fastest first few rows*. This heavily favors an **Index Scan**.
 
-Query Planner Behavior with LIMIT: PostgreSQL's query planner may opt for a sequential scan instead of an index scan when a LIMIT ...
+This is why "the plan changed when I added `LIMIT 10`" is not a bug report. And the same logic explains the case Stack Overflow records: "PostgreSQL's query planner may opt for a sequential scan instead of an index scan when a LIMIT ..." is present — the index's startup cost (`0.42` in the plans below) is a fixed tax you pay before the first tuple, and a sequential scan's startup cost is `0.00`.
 
-PostgreSQL
+The related plan shape worth knowing is Incremental Sort: "Compared to regular sorts, sorting incrementally allows returning tuples before the entire result set has been sorted" ([14.1 Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)) — that pre-sort-and-stream behaviour is what makes `LIMIT` plus `ORDER BY` on a partially-matching index viable.
 
-**Documentation: 18: 14.1. Using EXPLAIN - PostgreSQL**
+## The three plan shapes, with their numbers
 
-Compared to regular sorts, sorting incrementally allows returning tuples before the entire result set has been sorted, which parti...
-
-**Show all**
-
-## **You said: Explain**
-
-Explain
-
-16 September 2026
-
-When you run a query with a `LIMIT` clause in PostgreSQL, the database engine uses an optimization strategy called a **"Limit-Short-Circuit."** Instead of gathering all possible matching rows and then cutting off the extra ones, PostgreSQL stops the entire data-retrieval process the exact moment it finds enough rows to satisfy your limit.
-
-Here is a deeper look at how PostgreSQL handles scanning under the hood when a limit is applied.
-
----
-
-**1. The Cost Shift (The "Limit" Node)**
-
-When you look at a query plan using `EXPLAIN`, you will see a `Limit` node at the very top of the execution tree.
-
-The PostgreSQL query planner uses a concept called **Startup Cost** and **Total Cost**.
-
-- **Without a Limit:** The planner picks a strategy optimized to return _all_ rows as fast as possible (which often favors a **Sequential Scan** or a **Hash Join**).
-- **With a Limit:** The planner calculates how much work it takes to get just those few rows. It switches to a strategy optimized for the _fastest first few rows_. This heavily favors an **Index Scan**.
-
-**2. How it Behaves With vs. Without an Index**
-
-The performance of a limited scan depends entirely on whether your query can leverage an index.
-
-| **Scenario** | **How PostgreSQL Scans** | **Performance Impact** |
+| Scenario | How PostgreSQL scans | Performance impact |
 | :-- | :-- | :-- |
-| **With a Matching Index** <br />`ORDER BY created_at LIMIT 10` | It performs an **Index Scan**, reads exactly 10 pointers from the index, fetches those 10 rows from the table heap, and immediately stops. | **Extremely Fast.** It reads almost zero unnecessary data. |
-| **Without an Index** <br />`ORDER BY unindexed_col LIMIT 10` | It must perform a **Sequential Scan** of the entire table, pull all data into memory/disk, sort everything, and then give you the top 10. | **Slow.** The `LIMIT` provides almost no performance benefit here because the sort requires all rows. |
-| **No Sorting Rule** <br />`SELECT * FROM table LIMIT 10` | It begins a Sequential Scan from the physical start of the table files and stops dead after reading exactly 10 rows. | **Fast, but Unpredictable.** The rows returned depend entirely on how they are physically ordered on the disk. |
+| **With a matching index** — `ORDER BY created_at LIMIT 10` | Performs an **Index Scan**, reads exactly 10 pointers from the index, fetches those 10 rows from the table heap, and immediately stops | **Extremely fast.** It reads almost zero unnecessary data |
+| **Without an index** — `ORDER BY unindexed_col LIMIT 10` | Must perform a **Sequential Scan** of the entire table, pull all data into memory/disk, sort everything, and then give you the top 10 | **Slow.** The `LIMIT` provides almost no performance benefit here because the sort requires all rows |
+| **No sorting rule** — `SELECT * FROM table LIMIT 10` | Begins a Sequential Scan from the physical start of the table files and stops dead after reading exactly 10 rows | **Fast, but unpredictable.** The rows returned depend entirely on how they are physically ordered on disk |
 
-**3. The "Limit Trap" (When Optimization Backfires)**
+## The Limit trap
 
-Sometimes, the planner gets _too_ optimistic about a limit. This is known as a **Limit Trap**.
+Sometimes the planner gets *too* optimistic about a limit. This is what I call the **Limit trap**. Take:
 
-If you have a query like:
-
-**sql**
-
-```text
+```sql
 SELECT * FROM users WHERE status = 'active' ORDER BY created_at DESC LIMIT 1;
 ```
 
-Use code with caution.
+If there is an index on `created_at`, the planner reasons: "Great! I will scan the `created_at` index backwards. I only need one row, so I'll find an active user almost instantly!" However, if `status = 'active'` is extremely rare — say 1 out of 1,000,000 users — PostgreSQL ends up scanning millions of index entries looking for that single active user. A complete sequential scan would have been faster, but the planner was tricked by the `LIMIT 1`.
 
-If there is an index on `created_at`, the planner might think: _"Great! I will scan the_ `created_at `_index backwards. I only need one row, so I'll find an active user almost instantly!"_
+The arithmetic behind that trap is the part I want you to carry away. With selectivity `p = 1/1,000,000` and the index ordered by `created_at`, the number of entries you must examine to find `k` matches is negative-binomial with mean `k / p`. For `k = 10` that is `10 × 1,000,000 = 10,000,000` entries. And the probability that the first 854,000 entries contain no active user at all is `(1 - p)^854000 ≈ e^-0.854 = 0.426` — a 43% chance of exactly the `rows=0` outcome shown in the plan below. The trap is not an edge case; it is the expected case at that selectivity.
 
-However, if `status = 'active'` is extremely rare (e.g., only 1 out of 1,000,000 users), PostgreSQL will end up scanning millions of index entries looking for that single active user. A complete Sequential Scan would have been faster, but the planner was tricked by the `LIMIT 1`.
-
-Are you trying to **optimize a slow query** that uses `LIMIT`, or are you seeing an unexpected **Sequential Scan** instead of an **Index Scan** in your `EXPLAIN` plan? If you paste the **query** and your **table indexes**, I can show you exactly how to optimize it.
-
-## **You said: explain query**
-
-explain query
-
-16 September 2026
-
-To see exactly how PostgreSQL is scanning your table, you need to use the `EXPLAIN` or `EXPLAIN ANALYZE` command. This tells the database to show you its "execution plan"—the blueprint of how it intends to execute your query.
-
-Here is a guide on how to run it and what to look for when dealing with `LIMIT`.
-
----
-
-**1. How to Run the Command**
+## Reading the plan
 
 Prefix your query with `EXPLAIN (ANALYZE, BUFFERS)` and execute it in your database terminal or client:
 
-**sql**
-
-```text
+```sql
 EXPLAIN (ANALYZE, BUFFERS)
-SELECT * FROM users 
-WHERE status = 'active' 
-ORDER BY created_at DESC 
+SELECT * FROM users
+WHERE status = 'active'
+ORDER BY created_at DESC
 LIMIT 10;
 ```
 
-Use code with caution.
+- `EXPLAIN`: tells the planner to show the estimated plan.
+- `ANALYZE`: actually executes the query and shows the *real* execution times and row counts.
+- `BUFFERS`: shows how many data blocks were read from memory (shared hit) vs. disk (read).
 
-- `EXPLAIN`**:** Tells the planner to show the estimated plan.
-- `ANALYZE`**:** Actually executes the query and shows the _real_ execution times and row counts.
-- `BUFFERS`**:** Shows how many data blocks were read from memory (shared hit) vs. disk (read).
+Read the output top to bottom and look at the lines indented directly under the `Limit` node. There are three shapes you will actually see.
 
-**2. How to Read the Output (The Scan Types)**
-
-When you read the output from top to bottom, look at the lines indented directly under the `Limit` node. You will see one of three major scan types:
-
-**🔍 A. Index Scan (The Ideal Scenario)**
-
-**text**
+<CodeGroup>
+<Code language="text" title="A. Index Scan (the ideal scenario)">
 
 ```text
 Limit  (cost=0.42..8.60 rows=10 width=244) (actual time=0.015..0.082 rows=10 loops=1)
   ->  Index Scan using idx_users_created_at on users  (cost=0.42..818.40 rows=1000 ...)
 ```
 
-Use code with caution.
-
-- **What it means:** PostgreSQL used an index.
-- **The Limit Effect:** Notice the index scan cost could go up to `818.40` if it read the whole table, but because of the `LIMIT 10`, the total cost for this node stops at `8.60`. It read 10 rows and quit.
-
-**🐢 B. Sequential Scan + Top-N Heapsort (The Slow Scenario)**
-
-**text**
+</Code>
+<Code language="text" title="B. Sequential scan + top-N heapsort (the slow scenario)">
 
 ```text
 Limit  (cost=421.10..421.12 rows=10 width=244) (actual time=24.15..24.16 rows=10 loops=1)
@@ -148,14 +87,8 @@ Limit  (cost=421.10..421.12 rows=10 width=244) (actual time=24.15..24.16 rows=10
         ->  Seq Scan on users  (cost=0.00..380.00 rows=1640 width=244)
 ```
 
-Use code with caution.
-
-- **What it means:** There is no index matching your `ORDER BY` clause.
-- **The Limit Effect:** PostgreSQL had to do a `Seq Scan` (read every single row in the table) and feed them into a `top-N heapsort`. While the heapsort keeps memory usage low by only holding onto the top 10 rows at a time, the initial sequential scan still hurts performance on large tables.
-
-**⚠️ C. The Index Scan "Trap" (The Misguided Scenario)**
-
-**text**
+</Code>
+<Code language="text" title="C. The index scan trap (the misguided scenario)">
 
 ```text
 Limit  (cost=0.42..85.00 rows=10 width=244) (actual time=412.50..412.50 rows=0 loops=1)
@@ -164,16 +97,85 @@ Limit  (cost=0.42..85.00 rows=10 width=244) (actual time=412.50..412.50 rows=0 l
         Rows Removed by Filter: 854000
 ```
 
-Use code with caution.
+</Code>
+</CodeGroup>
 
-- **What it means:** The planner thought scanning the `created_at` index would be fast.
-- **The Limit Effect:** Because of the `LIMIT`, the planner thought it would find 10 active users immediately. Instead, look at `Rows Removed by Filter: 854000`. It had to scan through 854,000 dead/inactive rows just to try and satisfy your limit, making it incredibly slow.
+**A. Index Scan.** PostgreSQL used an index. Notice the index scan cost could go up to `818.40` if it read the whole table, but because of the `LIMIT 10`, the total cost for this node stops at `8.60`. It read 10 rows and quit. In time terms: `8.60` is 1.00% of the scan's variable cost (`818.40 - 0.42`), and the real cost was `0.082 ms` for 10 rows = `8.2 µs` per returned row.
 
----
+**B. Seq Scan + top-N heapsort.** There is no index matching your `ORDER BY` clause. PostgreSQL had to do a `Seq Scan` (read every single row in the table) and feed them into a `top-N heapsort`. While the heapsort keeps memory usage low by only holding onto the top 10 rows at a time, the initial sequential scan still hurts performance on large tables. The heapsort is the cheap part: `27kB` reported for 10 tuples of `width=244` is 2,440 B of payload plus 11x of sort-state and per-tuple overhead. The scan is the expensive part: `24.14 ms` over 1,640 rows.
 
-If you want to troubleshoot a specific query, please share:
+**C. The Index Scan trap.** The planner thought scanning the `created_at` index would be fast. Because of the `LIMIT`, the planner thought it would find 10 active users immediately. Instead, look at `Rows Removed by Filter: 854000`. It had to scan through 854,000 dead/inactive rows just to try and satisfy your limit, making it incredibly slow — `412.50 ms` for `rows=0`, and one row *never arrived at all*.
 
-1. The **exact SQL query** you are running.
-2. The **output text** of your `EXPLAIN (ANALYZE, BUFFERS) your_query;`.
+## The capacity calculation
 
-With that data, I can point out exactly where the bottleneck is occurring.
+I want the per-page and per-tuple numbers, because that is what tells me whether a plan shape scales. Start from `width=244` and the default 8 kB block:
+
+| Quantity | Value | How I got it |
+| :-- | :-- | :-- |
+| Tuple header | 24 B | heap tuple header, before the 244 B of data |
+| Line pointer (item id) | 4 B | per tuple, in the page's item array |
+| Page header + special space | 28 B | 24 B header + 4 B special |
+| Bytes per tuple on a page | 272 B | `24 + 4 + 244` |
+| Tuples per full page | 30 | `(8192 - 28) / 272 = 30.0` |
+| Pages for 1,000,000 rows | 33,334 | `1,000,000 / 30`, rounded up |
+| Table size | 260 MiB | `33,334 × 8 kB` |
+| Seq-scan cost units, 1M rows | 45,834 | `1.0 × pages + 0.0125 × rows` (defaults `seq_page_cost=1.0`, `cpu_tuple_cost=0.01`, `cpu_operator_cost=0.0025`) |
+| Cold read time, 1 GB/s | 0.273 s | `260 MiB / 1 GB/s` |
+| Cold read time, 3 GB/s | 0.091 s | `260 MiB / 3 GB/s` |
+| B-tree on `created_at`, 1M entries | ~27 MiB, 3,418 pages | `~28 B` per entry (key + pointer + tuple header) |
+
+Now compare that to plan B's declared size. Its `Seq Scan` cost of `380.00` for `rows=1640` back-solves to `380.00 - 0.0125 × 1640 = 359.5` pages, which means `1640 / 359.5 = 4.56` rows per page — not 30. Only 1,113 of each 8,192 bytes (13.6%) hold row data. I read that as a table that is bloated or very lightly filled (dead tuples, wide columns pushed to TOAST, or a stale `relpages`), and it is exactly the kind of discrepancy `EXPLAIN (ANALYZE, BUFFERS)` plus `pg_class` is for. A 6.6x gap between achieved and theoretical density is 6.6x more pages to scan for the same rows.
+
+Per-tuple timings from the plans, which is the currency I actually budget in:
+
+| Plan | Real time | Tuples touched | Cost per tuple touched | Cost per row returned |
+| :-- | :-- | :-- | :-- | :-- |
+| A: index scan + `LIMIT 10` | 0.082 ms | 10 | 8.2 µs | 8.2 µs |
+| B: seq scan + top-N sort | 24.14 ms | 1,640 | 14.7 µs | 2.42 ms |
+| C: index scan trap | 412.50 ms | 854,000 | 483 ns | 41.25 ms (and `rows=0`) |
+
+C looks "cheaper per tuple" than B and is still 17x worse in wall time, because the tuple count is three orders of magnitude larger and each tuple costs a random heap fetch behind the filter. The scaling consequence is what I care about: at 483 ns per entry examined, the expected 10,000,000 entries for `LIMIT 10` is `4.83 s` for one query. At 10 queries/s that is 4.1 cores of pure CPU; at 100 q/s it is 41 cores; at 1,000 q/s it is 412 cores. A plan shape that is merely bad becomes an infrastructure bill.
+
+## Operational mitigations
+
+<Steps>
+<Step title="Make the rare predicate part of the index">
+
+For the trap case, the fix is structural. A partial index `CREATE INDEX ON users (created_at DESC) WHERE status = 'active'` shrinks the scan target from 3,418 index pages to well under one page in that 1-in-a-million example, and it removes the `Rows Removed by Filter` term entirely — the filter is evaluated at index build time. A composite `(status, created_at DESC)` index is the general version when you cannot pin one value.
+
+</Step>
+<Step title="Give the planner the statistics it is missing">
+
+`status` and `created_at` are frequently correlated, and plain `pg_stats` cannot see that. `CREATE STATISTICS` on the dependency and ndistinct pair lets the row estimate reflect the correlation, which is what the `LIMIT` costing depends on. Then `ANALYZE` — the trap plans are often just stale estimates (`rows=1000` when the truth is 1,000,000).
+
+</Step>
+<Step title="Stop the scan from being the bottleneck">
+
+For legitimately large scans: raise `work_mem` so the top-N heapsort and any hash stays in memory (watch `Sort Method: external merge` in `BUFFERS` output), enable parallel sequential scan via `max_parallel_workers_per_gather` so a 260 MiB table is read by several workers, and add a covering index (`INCLUDE`) when you only need a few columns so the heap fetch disappears.
+
+</Step>
+<Step title="Make paging deterministic">
+
+`SELECT * FROM table LIMIT 10` with no `ORDER BY` is fast but unpredictable, and synchronized scans make it worse. I use keyset pagination (`WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 10`) against the index, and for background jobs that must not skip rows I set `synchronize_seqscans = off` for the session.
+
+</Step>
+<Step title="Verify, then guard it">
+
+Compare plans with `EXPLAIN (ANALYZE, BUFFERS)` before and after, check `shared hit` versus `read` to see whether you are I/O-bound or CPU-bound, keep the query in `pg_stat_statements` with `track_io_timing` on so regressions show up as a mean-time change, and only as a last resort pin behaviour with per-query settings — that is a diagnosis tool for me, not a production fix.
+
+</Step>
+</Steps>
+
+<Warning>
+Never use `OFFSET 1000000 LIMIT 10` as a paging strategy. The index scan still walks and discards a million entries, so you pay the trap's arithmetic on every page of a UI.
+</Warning>
+
+## What to capture when one of these is slow
+
+When I pick up someone's slow `LIMIT` query, the artifact I need is the same three things every time:
+
+1. The **exact SQL query** being run.
+2. The **output text** of `EXPLAIN (ANALYZE, BUFFERS)` for it.
+3. The **table's indexes** (`\d+ tablename`), plus row count and whether `status`-style predicates are correlated with the sort key.
+
+With those, the diagnosis is mechanical: if a `Limit` sits on an `Index Scan` with a nonzero `Rows Removed by Filter`, you have case C and need a partial or composite index; if a `Limit` sits above a `Sort` above a `Seq Scan`, you have case B and need either an index on the sort key or more `work_mem` and parallelism; if the estimated `rows` and the actual `rows` differ by orders of magnitude, you are fighting statistics, not indexes.

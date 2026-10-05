@@ -1,54 +1,163 @@
 ---
-title: "Caching LLM Chats to quick answer user query without RAG"
+title: "Caching LLM Chats to Quickly Answer User Queries Without RAG"
+description: "How prefix caching, context-cache IDs, and semantic answer caches let you skip the retrieval round trip, with the hit-rate math and the invalidation rules that make it safe."
 ---
 
-To share an LLM chat cache across multiple users, you must **use Automatic Prefix Caching (APC) on a self-hosted serving engine like vLLM or share a Cloud Provider Cache ID (such as Gemini Context Caching) for managed APIs**. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg), [2](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+I keep meeting the same reflex in Gen-AI reviews: somebody needs answers over a document set, and the first architecture sketch always has a vector database in it. Retrieval is a good default, but not the only option. When the corpus fits a context window and traffic is repetitive enough to hit a cache, I serve the answer out of cached context and skip the retrieval round trip. It is the same trick that makes the 0.7M-token cached-payload scenario in [User usage at scale](/user-usage) affordable.
 
-You cannot manually copy raw GPU memory cache files between distinct user sessions, but you can configure your infrastructure so multiple users automatically hit the same precomputed token blocks.
+The mechanism in one line: to share an LLM chat cache across multiple users you must either use **Automatic Prefix Caching (APC) on a self-hosted serving engine like vLLM**, or share a **cloud provider cache ID (such as Gemini Context Caching) for managed APIs**. I cannot copy raw GPU memory cache files between distinct user sessions — nobody hands me another tenant's KV blocks — but I can configure the infrastructure so many users land on the same precomputed token blocks.
 
----
+## What actually gets cached
 
-**Method 1: Local Inference with vLLM (Automatic Prefix Caching)**
+Three different things get called "the cache" in these conversations, and conflating them is how teams end up with a stale-answer bug they cannot trace. They have different keys, different hit-rate ceilings, and different invalidation costs.
 
-When hosting an open-source model locally or on your own cloud GPUs, vLLM automatically caches the Key-Value (KV) blocks of shared prompts (like long system instructions or base documents) across different incoming user requests. [[1](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+| Cache type | What is stored | Key | What it saves | Typical cost of a hit |
+| :-- | :-- | :-- | :-- | :-- |
+| **Prompt / context (KV) caching** | Precomputed attention KV blocks for a static prefix: system prompt, few-shot examples, the whole reference document set | Hash of the exact leading token sequence | The prefill pass, which is the expensive part of a long prompt | Skip reading; pay only for the new suffix |
+| **Answer (response) caching** | The finished assistant answer, sometimes with its citations | Normalised question string, or its embedding | The entire model call, retrieval included | A key-value lookup |
+| **Embedding caching** | Vector for a chunk or query, keyed by text hash | `sha256(model_id + text)` | The embedding-model inference only | A lookup, then ANN as usual |
 
-- **Enable APC on startup:** Launch your vLLM server with the `--enable-prefix-caching` flag. [[1](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+These are not competing options: prompt caching makes the model call *cheaper and faster*, answer caching makes it *not happen*. The answer-caching variant is called cache-augmented generation, or CAG — what the [Streamlit + vLLM + context caching walkthrough](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc) builds. It is RAG's sibling, not its enemy: I front-load knowledge into a cached prefix instead of retrieving at query time.
 
-  **bash**
-  ```text
-  python -m vllm.entrypoints.openai.api_server \
-      --model Qwen/Qwen2.5-7B-Instruct \
-      --enable-prefix-caching
-  ```
-  Use code with caution.
-- **How it works for multiple users:** User A and User B send requests that begin with the exact same system prompt or document text. vLLM recognizes the matching token prefix block in GPU memory, skips recomputation (prefill), and serves multiple users from the shared cache. [[1](https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d), [2](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
-- **Best Practice:** Keep the shared text (system prompt, few-shot examples, or reference data) completely identical and place it at the very beginning of the prompt string for every user request. [[1](https://www.youtube.com/watch?v=j9wVKM89XFU)]
+## The three ways to share one cache across users
 
----
+### Method 1 — Local inference with vLLM Automatic Prefix Caching
 
-**Method 2: Cloud Managed APIs (Vertex AI / Gemini Context Caching)**
+When I host an open-source model locally or on my own cloud GPUs, vLLM automatically caches the Key-Value (KV) blocks of shared prompts, such as long system instructions or base documents, across different incoming user requests. I enable it at startup with the `--enable-prefix-caching` flag:
 
-If you are using managed cloud APIs like Google Vertex AI, you can create a centralized cache object once and distribute its reference identifier to multiple user calls. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg)]
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --enable-prefix-caching
+```
 
-- **Create a central cache:** Upload your large files or long system prompts to the API to generate a `cache_id`.
-- **Share the Cache ID:** Pass that same `cache_id` in the initialization code for all subsequent user queries.
+User A and User B send requests beginning with the exact same system prompt or document text. vLLM recognises the matching prefix block already in GPU memory, skips that prefill, and serves both from the shared cache. In a multi-replica deployment KV blocks can be shared between engines across pods — see [llm-d's P2P KV cache sharing](https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d) — which matters because APC only helps requests landing on a replica that already holds the block. With round-robin routing and no session affinity, my effective hit rate for a cold block is roughly `1 / replicas`.
 
-  **python**
-  ```text
-  # Instead of sending the heavy prompt/file every time, reference the ID
-  model = GenerativeModel.from_cached_content(cached_content=my_cache_id)
-  response = model.generate_content("User specific question here")
-  ```
-  Use code with caution.
-- **How it works for multiple users:** All user requests pointing to that `cache_id` read from the same cloud-stored token memory, reducing processing costs and latency without duplicating data upload. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg)]
+The practice that decides whether any of this works: keep the shared text (system prompt, few-shot examples, or reference data) **completely identical and at the very beginning** of the prompt string for every request, as [this caching walkthrough](https://www.youtube.com/watch?v=j9wVKM89XFU) stresses. Prefix caching is prefix-matched, not substring-matched. One changed character — a timestamp, a request ID, a user name interpolated early — and every user pays the full prefill again. It is the most common way I see teams silently get zero benefit.
 
----
+### Method 2 — Cloud managed APIs with a shared cache ID
 
-**Method 3: Application-Level Semantic/Exact Caching (Redis)**
+With managed APIs such as Google Vertex AI, I create a central cache object once and distribute its reference identifier to many user calls, as described in this [Gemini context caching walkthrough](https://www.youtube.com/watch?v=eAUIanQMJJg):
 
-If you want to share previous _responses_ and conversation prompts across users at the application layer rather than the raw GPU level, use a caching proxy or database like Redis. [[1](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view), [2](https://www.youtube.com/watch?v=j9wVKM89XFU)]
+1. Create a central cache: upload the large files or long system prompts to the API to generate a `cache_id`.
+2. Share the cache ID: pass that same `cache_id` in the initialisation code for all subsequent user queries.
 
-- **Exact Match / Semantic Caching:** Hash incoming user queries or run vector similarity searches via a caching layer (such as Redis or Azure Managed Redis). [[1](https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching), [2](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view)]
-- **How it works for multiple users:** When User A asks a common question, the response is saved to Redis. When User B asks a matching or semantically identical question, the application returns the cached LLM answer instantly without hitting the LLM model again. [[1](https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching), [2](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view)]
+```python
+# Instead of sending the heavy prompt/file every time, reference the ID
+model = GenerativeModel.from_cached_content(cached_content=my_cache_id)
+response = model.generate_content("User specific question here")
+```
 
-If you can tell me whether you are using **local open-source models (like vLLM/Ollama)** or a **cloud API (like OpenAI/Gemini)**, I can provide the exact configuration or code snippet you need.
+All user requests pointing at that `cache_id` read from the same cloud-stored token memory, reducing cost and latency without duplicating the upload per user. Two properties I plan for: the cache is billed for storage while it exists, and it has a TTL I must refresh. If the renewal job fails, traffic does not error — it quietly reverts to full-price prefill, so I alert on cached-token ratio, not on cache errors.
+
+### Method 3 — Application-level exact and semantic caching
+
+If I want to share previous *responses* and conversation prompts at the application layer rather than the raw GPU layer, I use a caching proxy or a database like Redis. The strategies are summarised in this [LLM caching strategies overview](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view) and in [Azure's semantic caching guide](https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching).
+
+Exact-match caching hashes the incoming query; semantic caching runs a similarity search over previously asked questions and returns a stored answer when the distance is close enough. User A's common question is saved to Redis, and User B's matching or semantically identical question gets that cached answer with no model call ([same ordering idea](https://www.youtube.com/watch?v=j9wVKM89XFU)).
+
+```python
+import hashlib, json, time
+import redis
+
+r = redis.Redis()
+TTL, THRESHOLD = 3600, 0.92  # seconds, cosine similarity
+
+def key_for(question: str, corpus_version: str) -> str:
+    norm = " ".join(question.lower().split())
+    digest = hashlib.sha256(norm.encode()).hexdigest()[:24]
+    return f"ans:v{corpus_version}:{digest}"
+
+def answer(question, corpus_version, context, ask_llm, embed, r=r):
+    hit = r.get(key_for(question, corpus_version))          # 1. exact key
+    if hit:
+        return json.loads(hit)["answer"], "exact-cache"
+    vec = embed(question)                                   # 2. semantic scan
+    for k in r.scan_iter(f"ans:v{corpus_version}:*"):
+        rec = json.loads(r.get(k))
+        if cosine(vec, rec["q_vec"]) >= THRESHOLD:
+            return rec["answer"], "semantic-cache"
+    ans = ask_llm(context, question)                        # 3. model (or RAG)
+    r.setex(key_for(question, corpus_version), TTL,
+            json.dumps({"answer": ans, "q_vec": vec, "ts": time.time()}))
+    return ans, "computed"
+```
+
+## The lookup path I actually implement
+
+Ordered by cost per hit, cheapest first, and every level records which one served the request:
+
+<Steps>
+  <Step title="Exact answer cache">
+    Normalised question plus corpus version as the key. Sub-millisecond, no model call, and the only level that also skips retrieval.
+  </Step>
+  <Step title="Semantic answer cache">
+    Query embedding compared against recent questions. One embedding call, no LLM call. I start at 0.92 cosine and tune against labelled pairs.
+  </Step>
+  <Step title="Cached prefix, live generation">
+    The context sits in a cache object or an APC block, so prefill is skipped and decode still happens.
+  </Step>
+  <Step title="RAG fallback">
+    Retrieve top-k chunks and generate. The home for long-tail questions.
+  </Step>
+  <Step title="Write-through">
+    Store the answer and its embedding under the corpus version that produced it, so a document update can evict it.
+  </Step>
+</Steps>
+
+Instrument the served-by ratio from day one, or I cannot tell whether the cache earns its complexity.
+
+## Hit-rate math
+
+Let `h` be the fraction of requests served without a model call. Cost per query becomes `E[cost] = h × lookup_cost + (1 − h) × pipeline_cost`, and latency behaves the same way. So the whole business case collapses onto one number: how repetitive is my traffic?
+
+FAQ traffic is far more repetitive than people expect. A rough Zipf assumption — the top 20% of distinct questions carrying about 80% of volume — gives me a planning figure of `h ≈ 0.7` for exact match on a hotel-support bot, with semantic match buying another 5–10 points. Normalising the question (strip punctuation, lower-case, collapse whitespace, move the user name and property ID into metadata instead of the query text) is what makes the exact key hit at all.
+
+Now the arithmetic on numbers I use elsewhere in this repo: **71,220 daily active users**, **5,000 unique input tokens** and **1,500 output tokens** per query, GPT-5.4 at **$2.50 per million input** and **$15.00 per million output** ([User usage at scale](/user-usage)):
+
+| Architecture | Tokens billed per query | Cost per query | Daily cost | Monthly (x30) |
+| :-- | :-- | :-- | :-- | :-- |
+| RAG only, 5,000 in + 1,500 out | 5,000 in + 1,500 out | **$0.0350** | $2,492.70 at $15/M out; **$1,958.55** at the $10/M baseline in `/user-usage` | ~$58,756.50 at baseline rates |
+| Cached 0.7M-token context, every query | 700,000 cached at $0.25/M + 5,000 fresh + 1,500 out | **$0.2100** | **$14,956.20** | **~$448,686.00** |
+| Same 0.7M payload with no caching | 700,000 fresh at $2.50/M | $1.7500 | over **$125,000** (uncached total ~$127,127.70) | unsustainable |
+| Cached 0.7M on GPT-5.6 Sol | 700,000 cached at $0.40/M + $4.00/M in + $20.00/M out | $0.3300 | **$23,502.60** | **~$705,078.00** |
+
+Two conclusions. Cached context is 6x more expensive per query than a 5,000-token RAG payload on the same model — caching does not make a huge context free, it makes it merely survivable. Answer caching changes the shape of the curve: at `h = 0.5` the effective RAG per-query cost is **$0.0175**, and at `h = 0.8` it is **$0.0070**, thirty times cheaper than a single 0.7M-token cached read. If questions repeat, caching the *answer* beats caching the *context* by a wide margin.
+
+<Note>
+Latency splits the same way. A Redis answer hit is a sub-millisecond read plus network. A cached-prefix hit skips prefill. A RAG round trip is an ANN lookup — a scalable vector store is expected to answer in sub-100 milliseconds, per [Scalable vector database](/scalablae-vector-database) — plus a short generate. An uncached long context is the worst case: 10 to 30 seconds of prefill at 1M tokens, 2 to 5 minutes at 10M, as recorded in [Why need RAG if gemini can answer](/why-need-rag-if-gemini-can-answer).
+</Note>
+
+## Invalidation and staleness
+
+This is where cached-context systems fail in production, and none of it is model-specific.
+
+- **Version the key.** Put a corpus version (or a content hash of the retrieved context) into the cache key, so a document move evicts the answers that depended on it.
+- **Prefix mutation is a wipe.** Editing the cached system prompt or reference set invalidates every derived KV block. Publish the change as a new `cache_id` and roll traffic over, rather than mutating in place and serving two versions at once.
+- **Mind the TTL and the renewal job.** Managed caches expire; APC blocks are evicted under memory pressure. Both failures are silent and both look like "the model got slow and the bill doubled".
+- **Beware semantic poisoning.** A semantically matched answer served to a different question is worse than a miss — `What time is check-in?` and `What time is check-out?` are neighbours. Keep the threshold high, store the question text with the answer, and require agreement on the discriminative tokens before serving a hit.
+- **Never cache personalisation.** If the answer depends on who is asking, the key must include the user, plan tier, and entitlements — at which point the hit rate collapses and answer caching stops paying.
+- **Never cache the unverifiable.** Anything time-sensitive (availability, price, weather, room inventory) is excluded by policy, not by TTL luck.
+
+<Warning>
+The dangerous failure mode is not a cache miss. It is a cache hit on an answer that used to be correct. Every write to the source corpus should trigger an explicit eviction for the affected `corpus_version`, and I want that eviction counted and alerted on.
+</Warning>
+
+## When this beats RAG
+
+I choose cached context or cached answers over a retrieval pipeline when most of these hold:
+
+| Condition | Cached context / answer wins | RAG wins |
+| :-- | :-- | :-- |
+| Corpus size | Fits in the window; a few hundred thousand tokens | Gigabytes to billions of chunks |
+| Corpus churn | Changes weekly or slower | Changes per minute |
+| Query distribution | Concentrated; a long flat FAQ tail | Long-tail, compositional, multi-hop |
+| Freshness need | Stale by minutes is fine | Must reflect the last write |
+| Access control | Same answer for everyone | Answer depends on requester's permissions |
+| Cost driver | Prefill dominates the bill | Volume dominates; per-query payload must stay tiny |
+
+The rule I use: **if the corpus fits the window and the traffic is repetitive, cache; if the corpus is bigger than the window or the questions are novel, retrieve; and put answer caching on top of RAG rather than instead of it.** For one analyst asking one question of a codebase, dumping everything into a cached context is genuinely better — no index to build, no chunking to tune, no recall to lose. For 71,220 users a day the same architecture runs to $448,686 a month, which is why `/user-usage` slices the 700k payload with vector search and loads about 20k tokens per prompt.
+
+<Tip>
+Either way the first 20 minutes of work is identical: freeze the shared prefix, version it, and log which layer served each request. Everything after that — APC flags, `cache_id` rotation, Redis thresholds — is tuning against measured hit rate. See [Complete RAG tutorial](/complete-rag-tutorial) for the retrieval fallback built end to end, and [Latest Terms in GenAI - 30 Sep](/latest-terms-in-gen-ai-30-sep) for the KV-cache vocabulary above.
+</Tip>

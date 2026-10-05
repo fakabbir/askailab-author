@@ -1,5 +1,258 @@
 ---
-title: "Searning in a BST"
+title: "Searching in a BST"
+description: "How search works in a binary search tree, why depth rather than node count is the cost, the degenerate-chain case, and when to use AVL, red-black, treap, or B-tree instead."
 ---
 
-[https://codeforces.com/blog/entry/61364](https://codeforces.com/blog/entry/61364)
+A binary search tree is the smallest structure that gives me ordered lookups *and* ordered iteration, and searching it is eight lines of code. The interesting part is not the code — it is that the cost is the depth of the tree, which nobody controls directly, and which can silently become a linked list.
+
+## Reference this page came from
+
+These notes started from [Codeforces blog entry 61364, "[Tutorial] Searching Binary Indexed Tree in O(log(N)) using Binary Lifting"](https://codeforces.com/blog/entry/61364) by sdnr1, which is about searching a *Fenwick tree* rather than a BST. I kept both topics here because they are the same question — "find the position whose running total crosses a value" — answered in two different structures, and the second one is covered in [Fenwick Tree and Segment Tree](/fenwick-tree-and-segment-tree).
+
+## The invariant
+
+> Everything in a node's left subtree is smaller than the node; everything in its right subtree is larger; and both subtrees satisfy the same property.
+
+That is the ordered property, and it is maintained by every operation rather than checked by any. Search becomes a single descent because of it: at each node one comparison tells me which half of the remaining keys can contain my target, and I discard the other half forever. A miss is equally definitive — the descent runs out of nodes, so no path can contain the key.
+
+Duplicates need an explicit policy. I either refuse them (`elif key > cur.key`, so equal keys never descend), route them left and allow them, or store a count at the node. The first is what my code does:
+
+```python
+class Node:
+    __slots__ = ("key", "left", "right")
+
+    def __init__(self, key):
+        self.key = key
+        self.left = None
+        self.right = None
+```
+
+```python
+def insert_iterative(root, key):
+    new = Node(key)
+    if root is None:
+        return new
+    cur = root
+    while True:
+        if key < cur.key:
+            if cur.left is None:
+                cur.left = new
+                return root
+            cur = cur.left
+        elif key > cur.key:
+            if cur.right is None:
+                cur.right = new
+                return root
+            cur = cur.right
+        else:
+            return root  # duplicate: keep the existing node
+```
+
+## Recursive versus iterative search
+
+```python
+comparisons = 0
+
+
+def search_recursive(root, key):
+    global comparisons
+    if root is None:
+        return None
+    comparisons += 1
+    if key == root.key:
+        return root
+    if key < root.key:
+        return search_recursive(root.left, key)
+    return search_recursive(root.right, key)
+
+
+def search_iterative(root, key):
+    global comparisons
+    comparisons = 0
+    cur = root
+    while cur is not None:
+        comparisons += 1
+        if key == cur.key:
+            return cur
+        cur = cur.left if key < cur.key else cur.right
+    return None
+```
+
+Same comparisons, same path, and the recursive version is easier to read. The difference is that the recursive one stores the return path in the call stack, so its memory cost is the tree depth, and it inherits the interpreter's recursion limit. On a balanced tree of a million nodes the depth is around 20, and I would never notice. On a chain of 20000 nodes I did notice:
+
+```text
+recursive search on a 20000-node chain: RecursionError
+iterative search on the same chain: 20000
+```
+
+I write search iteratively and insert iteratively for exactly that reason. [Stack](/stack) covers the rewrite mechanics.
+
+## Cost is depth, not n
+
+A search does one comparison per level, so the cost is `O(depth)` and nothing else. Measured on a tree built by inserting 0..1999 in sorted order:
+
+```text
+sorted insertion  -> longest root-to-leaf path holds 2000 nodes (= n, i.e. 1999 edges)
+avg comparisons per successful search on the chain: 1000.5 (naive scan = 1000.5 )
+```
+
+Averages are identical to scanning an array. This is the degenerate case: sorted (or reverse-sorted, or otherwise adversarially ordered) input produces a tree that is a linked list wearing a tree's interface. `n = 2000` costs 1000 comparisons per lookup, and the "O(log n)" I wrote on the design doc is simply not true of it.
+
+Worse, the failure is invisible in reviews. The shape depends on *insertion order*, which is a property of the data stream, not the code. A BST built from a timestamp-ordered feed is a chain, and it passes every unit test that uses a hand-written seven-node tree.
+
+## What random insertion actually buys
+
+```python
+def build(keys):
+    root = None
+    for k in keys:
+        root = insert_iterative(root, k)
+    return root
+
+
+def depth(root):
+    """Iterative on purpose: the recursive version overflows on the chain we measure here."""
+    best = 0
+    stack = [(root, 1)] if root else []
+    while stack:
+        node, level = stack.pop()
+        if node is None:
+            continue
+        best = max(best, level)
+        stack.append((node.left, level + 1))
+        stack.append((node.right, level + 1))
+    return best
+```
+
+Building 40 trees from shuffled 0..1999 and averaging:
+
+```text
+random insertion  -> avg depth 24.6 vs log2(n) = 11.0
+random insertion  -> avg comparisons per search 13.2
+```
+
+So random insertion gives roughly `O(log n)` with a constant: the ideal balanced depth is 11, I measured 24.6, about 2.2x worse. The matching theory is that a random BST has expected height proportional to `4.31 ln n` (slow convergence) and an average successful search costs about `2 ln n` comparisons, which for `n = 2000` is 15.2 — close to my measured 13.2. The practical reading: "expected logarithmic" is a statement about *random input order*, and I never control input order in production.
+
+The tiny tree below shows both the hit and the miss cost, and that a miss is not a full traversal:
+
+```text
+recursive search for 35: found, comparisons = 4
+iterative search for 45: miss, comparisons = 3 (visited one path only)
+```
+
+Keys `[50, 30, 70, 20, 40, 60, 80, 35]`: finding 35 walks `50 → 30 → 40 → 35`, and searching for the absent 45 walks `50 → 30 → 40` and stops. A miss costs the same as a hit at that depth, and it is not wasted work: the path I walked is the floor and ceiling of the missing key. Every time I turn right I pass a node smaller than the target, so the **last right turn is the largest key below it** (floor); every left turn passes a node larger, so the **last left turn is the smallest key above it** (ceiling). I verified both against the sorted key list on that tree:
+
+```text
+target 45 -> floor/ceil via failed search: (40, 50) sorted keys: [20, 30, 35, 40, 50, 60, 70, 80]
+target 25 -> floor/ceil via failed search: (20, 30) sorted keys: [20, 30, 35, 40, 50, 60, 70, 80]
+target 65 -> floor/ceil via failed search: (60, 70) sorted keys: [20, 30, 35, 40, 50, 60, 70, 80]
+target 100 -> floor/ceil via failed search: (80, None) sorted keys: [20, 30, 35, 40, 50, 60, 70, 80]
+target -5 -> floor/ceil via failed search: (None, 20) sorted keys: [20, 30, 35, 40, 50, 60, 70, 80]
+```
+
+The two out-of-range targets are the edge cases that show up in practice: above the maximum, the ceiling stays `None` and the floor is the rightmost node; below the minimum, the reverse. Getting left and right backwards here is easy, and it produces a `floor` that returns the ceiling — a bug that passes any test using a key that exists.
+
+## The balanced variants, and what decides each
+
+All of them exist to make the depth bound unconditional instead of probabilistic. The differentiator is *how strictly* they enforce balance, because enforcement is paid for in rotations or splits per write.
+
+| Structure | Balance rule | Worst-case depth | What it optimizes for |
+| --- | --- | --- | --- |
+| Plain BST | none | `n` | nothing; fine for a hand-built tree over known data |
+| AVL | subtree heights differ by at most 1 | `1.44 log2 n` | reads; the tightest bound and the most rotations |
+| Red-black | no path is more than 2x any other | `2 log2 (n+1)` | mixed read/write; cheaper repairs, hence `std::map`, `TreeMap` |
+| Treap | heap priority on random keys | `O(log n)` expected | simplicity, split/merge, implicit-sequence tricks |
+| B / B+ tree | node fullness, high fan-out | `log_fanout n` | page storage: one IO per level instead of one per node |
+| Skip list | geometric level sampling | `O(log n)` expected | lock-free and concurrent variants; no rotation logic |
+
+The choices I have actually had to make:
+
+**AVL versus red-black** is a rotation-count tradeoff. AVL's stricter rule gives ~1.44 log n versus red-black's 2 log n, so searches touch fewer nodes, but every insert can trigger rotations further up the tree. For a lookup-heavy index that rarely changes, AVL. For something closer to a general ordered map, red-black — which is why the standard libraries converged on it despite the worse search bound. The 25% slower search turned out to be less valuable than predictable writes.
+
+**Treap** is the one I reach for when I need operations a rotation-based tree handles badly: split at a key, merge two trees, or index by position rather than value (the "implicit treap", which gives me insert/delete/subarray-reverse in a sequence). Balance comes from random priorities instead of repair logic, so the code is short and the invariant is probabilistic — same assumption as random insertion, but the tree makes it true regardless of input order because I generate the randomness myself.
+
+**B-tree** is the answer once data leaves RAM. A BST reads one node per level, so on disk a depth-20 tree is 20 separate IOs, which is fatal. A B-tree node holds dozens to hundreds of keys, so fan-out is large and depth for a billion rows is three or four. The key is not the algorithm but the unit of transfer: the BST's node is a cache line, the B-tree's is a page. Every database index I have used is a B+ tree for exactly this reason, and the write-heavy alternative (LSM trees) exists because inserting into a B+ tree means mutating a page at random. See [Sequential Database Scan](/sequential-database-scan) for the read-path side of that trade.
+
+## The alternatives that are not trees
+
+Before I add a balanced tree to a service, I check three cheaper options. **A sorted array with `bisect`** gives `O(log n)` lookups with better constants than any tree, and I only pay an `O(n)` insert when the array actually changes — for a lookup table rebuilt nightly, this is strictly better. **A hash map** is `O(1)` and has no order; if I do not need range scans or neighbours, a tree is a pure loss, which is the situation [AlgoMonster describes for TreeMap-shaped interview problems](https://algo.monster/blog/python-treemap) in Python specifically. **A heap** if I only ever want the extreme, and a [Fenwick tree or segment tree](/fenwick-tree-and-segment-tree) over a compressed key range if what I actually want is counts and prefix sums rather than nodes.
+
+## Search inside a Fenwick tree, the same question elsewhere
+
+The linked blog's problem is: an array `A` of `N` **non-negative** values, with point updates, prefix sums, and "search for a prefix sum" — a `lower_bound` over the cumulative array. Because all values are non-negative, the prefix-sum array is monotonic, so binary searching it is legitimate. The naive form costs `O(log^2 N)`: `log N` iterations, each doing a `O(log N)` BIT prefix sum.
+
+```python
+class Fenwick:
+    def __init__(self, n):
+        self.n = n
+        self.bit = [0] * (n + 1)
+
+    def add(self, i, delta):
+        i += 1
+        while i <= self.n:
+            self.bit[i] += delta
+            i += i & -i
+
+    def prefix(self, i):
+        s = 0
+        while i > 0:
+            s += self.bit[i]
+            i -= i & -i
+        return s
+
+    def find(self, target):
+        """Largest idx whose prefix sum is < target, via binary lifting. O(log n)."""
+        idx = 0
+        acc = 0
+        step = 1 << (self.n.bit_length() - 1)
+        while step:
+            nxt = idx + step
+            if nxt <= self.n and acc + self.bit[nxt] < target:
+                idx = nxt
+                acc += self.bit[nxt]
+            step >>= 1
+        return idx
+
+
+counts = [2, 0, 3, 1, 4, 0, 2, 5]
+cfw = Fenwick(len(counts))
+for i, v in enumerate(counts):
+    cfw.add(i, v)
+cum = []
+run = 0
+for v in counts:
+    run += v
+    cum.append(run)
+print("counts:", counts, "cumulative:", cum)
+for t in (1, 2, 3, 8, 9, 17, 18):
+    k = cfw.find(t)
+    naive_k = next((i for i in range(len(cum)) if cum[i] >= t), len(cum))
+    nxt = min(k + 1, len(counts))
+    print(f"find({t}) -> {k}  naive lower_bound -> {naive_k}  prefix({k})={cfw.prefix(k)} prefix({nxt})={cfw.prefix(nxt)}  match={k == naive_k}")
+```
+
+`find` returns the number of leading entries whose running total stays below `target`, which is the 0-based index of the lower bound; when `target` exceeds the total it returns `n`, the same convention `bisect` uses. The step ladder is `2^(floor(log2 n))` down to `2^0`, setting one bit of the answer per level — that is the entire "binary lifting" idea, and it is why the walk is `O(log N)` instead of `O(log^2 N)`: I climb the tree itself rather than restarting a prefix sum at each binary-search midpoint.
+
+```text
+counts: [2, 0, 3, 1, 4, 0, 2, 5] cumulative: [2, 2, 5, 6, 10, 10, 12, 17]
+find(1) -> 0  naive lower_bound -> 0  prefix(0)=0 prefix(1)=2  match=True
+find(2) -> 0  naive lower_bound -> 0  prefix(0)=0 prefix(1)=2  match=True
+find(3) -> 2  naive lower_bound -> 2  prefix(2)=2 prefix(3)=5  match=True
+find(8) -> 4  naive lower_bound -> 4  prefix(4)=6 prefix(5)=10  match=True
+find(9) -> 4  naive lower_bound -> 4  prefix(4)=6 prefix(5)=10  match=True
+find(17) -> 7  naive lower_bound -> 7  prefix(7)=12 prefix(8)=17  match=True
+find(18) -> 8  naive lower_bound -> 8  prefix(8)=17 prefix(8)=17  match=True
+randomized cross-check binary-lifting find vs naive lower_bound: passed = True
+```
+
+`prefix(i)` in that class is exclusive — it sums indices `0` through `i-1` — which is why `find(1)` reports index 0 with `prefix(0)=0` and `prefix(1)=2`. Off-by-one conventions between 0-based and 1-based Fenwick code are the main reason this transcription takes me two attempts; the C++ original from the blog uses 1-based indices and a `LOGN` constant instead of `bit_length()`.
+
+<Warning>
+The non-negativity requirement is not a style preference. With a negative value in the array the cumulative sequence stops being monotonic and `find` returns an index that satisfies no property at all — no error, just a wrong answer. I ran `counts = [3, -5, 10, 1]`, cumulative `[3, -2, 8, 9]`, and `find(4)` returned 2, which corresponds to nothing.
+</Warning>
+
+The parallel to BST search is exact and it is the point of this page: the greedy walk works because a structure encodes a monotone decision at each level — "which subtree" in a BST, "which power-of-two block" here. The differences are what I would put in a design review. A BST's shape follows insertion order and can degenerate; a BIT's shape is fixed by index arithmetic and cannot. A BST needs balancing machinery to guarantee `O(log n)`; the BIT gets it free but can only search monotonic aggregates built from non-negative values. And the blog's own caveat is worth repeating: segment trees, policy-based data structures and treaps can also do that third operation in `O(log N)`, but they are harder to implement and carry a larger constant, so they may end up slower than the plain `O(log^2 N)` binary search over a BIT. Constant factors are a real constraint, not an optimization-stage afterthought.
+
+## Edge cases I test
+
+Search on an empty tree (`None`, not a crash); a key smaller than everything and larger than everything (both should fall off the bottom of one branch); a miss on a key between two existing keys; duplicate insertion, which must leave the tree unchanged; and deletion of the root, where the two-children case hands the job to the in-order successor and most hand-written BSTs break. Then one test that only makes sense here: build from sorted input and assert the depth, so a silent degeneration fails a test instead of failing at 3 a.m. with an unexplained latency cliff.
