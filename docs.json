@@ -1,6 +1,6 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "sequoia",
+  "theme": "willow",
   "name": "Ask AI Labs",
   "colors": {
     "primary": "#16A34A",
