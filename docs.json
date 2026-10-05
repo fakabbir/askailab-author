@@ -9,7 +9,7 @@
   },
   "favicon": "/favicon.svg",
   "navigation": {
-    "pages": [
+    "groups": [
       {
         "group": "Trip @ Scale",
         "pages": [
