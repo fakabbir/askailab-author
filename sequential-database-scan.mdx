@@ -153,6 +153,8 @@ For the trap case, the fix is structural. A partial index `CREATE INDEX ON users
 
 For legitimately large scans: raise `work_mem` so the top-N heapsort and any hash stays in memory (watch `Sort Method: external merge` in `BUFFERS` output), enable parallel sequential scan via `max_parallel_workers_per_gather` so a 260 MiB table is read by several workers, and add a covering index (`INCLUDE`) when you only need a few columns so the heap fetch disappears.
 
+When the same expensive shape repeats on hot keys, I take the read off Postgres entirely and cache the decision — that is the path I walk through in [Optimizing Redis with Lua scripts](/optimizing-redia-via-lua-script), where a counter or a bounded-staleness read is served without ever waking the executor.
+
 </Step>
 <Step title="Make paging deterministic">
 
@@ -179,3 +181,7 @@ When I pick up someone's slow `LIMIT` query, the artifact I need is the same thr
 3. The **table's indexes** (`\d+ tablename`), plus row count and whether `status`-style predicates are correlated with the sort key.
 
 With those, the diagnosis is mechanical: if a `Limit` sits on an `Index Scan` with a nonzero `Rows Removed by Filter`, you have case C and need a partial or composite index; if a `Limit` sits above a `Sort` above a `Seq Scan`, you have case B and need either an index on the sort key or more `work_mem` and parallelism; if the estimated `rows` and the actual `rows` differ by orders of magnitude, you are fighting statistics, not indexes.
+
+## Where the scan lands in the rest of the system
+
+A plan that reads 33,334 pages per request is only a bug if the request rate makes it hot. I convert the per-query number into load with the same arithmetic I use in [FastAPI load performance](/fast-api-load-performance): decisions per second times pages per decision gives the I/O the box must absorb, and the cores table above is what tells me whether to fix the index or add workers. Dashboard-style aggregations over usage data — the shape that scans every row by definition — are where I stop pretending an index helps and pre-aggregate instead; [User usage](/user-usage) and [Vector clocks for CRDTs](/vector-clocks-for-crdt) cover the counters and the merge semantics behind those rollups, and the scan cost is what sets how often I can afford to rebuild them.

@@ -92,7 +92,7 @@ The client sees 3x fewer round trips and 65% less waiting. The server does sligh
 
 **Sending large scripts over the network repeatedly wastes bandwidth. Instead, production applications use `SCRIPT LOAD` to store the script on the server once, then execute it via its unique SHA1 hash using `EVALSHA`** ([DevGenius on Lua performance](https://blog.devgenius.io/lua-scripting-in-redis-for-performance-gain-6ca3970a9125), [Bullet-proofing Lua scripts in redis-py](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/), [Redis EVAL intro](https://redis.io/docs/latest/develop/programmability/eval-intro/)).
 
-The hash is literally `sha1(script_source)`, which I verified: my 576-byte script's local SHA-1 and the value returned by `SCRIPT LOAD` were the same 40-character digest, `f51d4c585273ad9be8595b474f9c31224b3c86f7`. The byte math on the wire:
+The hash is literally `sha1(script_source)`, which I verified: my 576-byte script's local SHA-1 and the digest Redis held for those exact bytes were the same 40-character value, `f51d4c585273ad9be8595b474f9c31224b3c86f7` (`SCRIPT EXISTS` on it returned 1 right after `redis-cli --eval` loaded the file). Beware the off-by-one-byte trap here: passing the source through `$(cat rate_limit.lua)` strips the trailing newline, so the server hashes 575 bytes and reports a different digest. The byte math on the wire:
 
 - `EVAL`: 576 B of source + key/arg frames, every call.
 - `EVALSHA`: 40 B of digest + the same frames, every call.
@@ -154,30 +154,39 @@ For Redis 7 and later I prefer **functions** (`FUNCTION LOAD`, `FCALL`) over ad-
 
 ## The single-threaded consequence of a slow script
 
-Redis executes commands on one thread. A script is one command, so a slow script is not "one slow request" — it is a stop-the-world event for every other client on that node. I measured the effect directly:
+Redis executes commands on one thread. A script is one command, so a slow script is not "one slow request" — it is a stop-the-world event for every other client on that node. I measured the effect directly against a loopback Redis 8.8.0:
 
 ```text
-PING median, server idle : 0.082 ms
-read-only script 213.2 ms -> returned 1800000030000000
-PING samples while it ran: 1744 (errors: 0)
-PING median while busy   : 0.082 ms   worst: 213.144 ms
+== idle baseline ==
+PING with idle server: samples=983 refused=0 median=0.151 ms max=0.407 ms
+
+== one long read-only script ==
+script returned 7200000060000000 in 404.9 ms
+PING while the script ran: samples=155 refused=0 median=0.151 ms max=404.694 ms
 ```
 
-That worst-case PING of 213.144 ms against a 213.2 ms script is the point: **an unrelated client's tail latency equals your script's runtime.** Anything Redis is doing during that window — expiry, replication backlog writes, AOF fsync scheduling, other clients' commands — waits. Once a script passes `lua-time-limit` (5000 ms by default), Redis starts refusing other clients instead of queueing them; with the limit at 200 ms I watched 8,177 of 8,558 probe PINGs get rejected:
+That max PING of 404.694 ms against a 404.9 ms script is the point: **an unrelated client's tail latency equals your script's runtime.** The median is flattering — only the request that was already queued when the script started pays the whole thing, and every client behind it inherits the same wait. Anything Redis is doing during that window (expiry processing, replication backlog writes, AOF fsync scheduling, other clients' commands) waits too.
+
+Once a script passes `lua-time-limit` (5000 ms by default), Redis stops queueing other clients and starts refusing them. With the limit lowered to 200 ms and a runaway read-only script, I watched 35,091 of 35,205 probe PINGs get rejected:
 
 ```text
-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.
+PING while runaway: samples=35205 refused=35091 median=0.154 ms max=0.338 ms
+reply other clients receive: BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.
+victim (16116 ms): completed
 ```
 
-Then the escape hatch depends on whether the script has written anything yet:
+Note that the victim ran to completion: my kill attempt landed after the script had already ended, and `SCRIPT KILL` answered `-NOTBUSY No scripts in execution right now`. The escape hatch depends on whether the script has written anything yet, which I caught correctly in a second run:
 
 ```text
-SCRIPT KILL on a read-only script:      +OK
-   victim: ERR Script killed by user with SCRIPT KILL... script: 123ceca8..., on @user_script:1.
-SCRIPT KILL on a script that already wrote:
-   -UNKILLABLE Sorry the script already executed write commands against the dataset.
-     You can either wait the script termination or kill the server in a hard way
-     using the SHUTDOWN NOSAVE command.
+read-only runaway (5e7-iteration loop)
+   SCRIPT KILL -> +OK   (answered after 0.8 ms)
+   victim, 252 ms: ERR Script killed by user with SCRIPT KILL... script: 123ceca8d8748faa0bfad3941a96cacdc55ada37, on @user_script:1.
+
+runaway that already wrote
+   SCRIPT KILL -> -UNKILLABLE Sorry the script already executed write commands against the dataset. You can either wait the script
+   termination or kill the server in a hard way using the SHUTDOWN NOSAVE command.   (answered after 0.5 ms)
+   victim, 2044 ms: 240000000
+   GET during -> written
 ```
 
 So a runaway read-only script is survivable, and a runaway *writing* script is not: your only options are to wait it out or hard-kill the node and accept the divergence risk. That asymmetry is the reason my review checklist for any Lua in Redis is: bounded loops only (iterate over `ARGV`, never over the keyspace — `KEYS *` inside a script is how you take down a node), no unbatched fan-out, work proportional to a client-supplied argument count so a hostile caller cannot choose your runtime, and a `slowlog`/`latency monitor` alert on any script exceeding a millisecond or two.
