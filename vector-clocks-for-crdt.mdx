@@ -1,0 +1,40 @@
+---
+title: "vector clocks for CRDT"
+---
+
+[Vector clocks](https://algoroq.io/concepts/vector-clocks/) are data structures used in distributed systems to track causality and identify concurrent, conflicting updates without relying on physical wall-clock time.
+
+GeeksforGeeks +1
+
+How Vector Clocks Work
+
+- **Structure:** An array or map of logical counters, with one entry for each node or process in the system.
+- **Initialization:** All clock values start at zero for every node.
+- **Local Events:** A node increments its own counter in its vector when a local event or write occurs.
+- **Message Transmission:** A node attaches its entire vector clock when sending a message to another node.
+- **Message Reception:** Upon receiving a message, a node takes the element-wise maximum of its own vector and the incoming vector, then increments its own counter.
+  YouTube·Software Interviews Prep
+
+Causality and Conflict Detection
+
+- **Happened-Before (V₁ ≤ V₂):** Event 1 causally precedes Event 2 if every element in V₁ is less than or equal to V₂, and at least one element is strictly smaller.
+  YouTube·Software Interviews Prep
+- **Concurrency / Conflict:** Two events are concurrent (neither happened before the other) if
+  V1≰V2cap V sub 1 is neither less than nor equal to cap V sub 2
+
+  𝑉1≰𝑉2
+
+   and
+  V2≰V1cap V sub 2 is neither less than nor equal to cap V sub 1
+
+  𝑉2≰𝑉1
+
+  , signaling a potential write conflict that requires merging.
+  Medium +1
+
+Relationship with CRDTs
+
+- **Role in [CRDTs](https://adamwulf.me/2021/05/distributed-clocks-and-crdts/):** While raw vector clocks detect conflicts and pass them to applications or return "siblings" (like in DynamoDB or Riak), state-based or operation-based Conflict-free Replicated Data Types embed causal tracking directly into mathematical lattices.
+  [www.systemdesignacademy.com](http://www.systemdesignacademy.com) +2
+- **Evolution:** Advanced CRDT designs often use fine-grained metadata like version vectors, dotted version vectors (DVVs), or per-element dots instead of a monolithic vector clock to reduce memory overhead and avoid unbounded size growth in large clusters.
+  Matthew Weidner +1

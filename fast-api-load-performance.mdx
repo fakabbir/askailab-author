@@ -1,0 +1,281 @@
+---
+title: "FastAPI Load Performance"
+---
+
+whats the RPS a 4GB, 1 core CPU fastapi can handle for simple sql async write and read
+
+On a **1 core CPU and 4GB RAM** instance, a fully asynchronous FastAPI application performing simple SQL read and write operations can reliably handle **300 to 1,000 Requests Per Second (RPS)** under optimal configuration.
+
+Medium
+
+While FastAPI can hit over 2,000+ RPS on a single core for completely "empty" or hardcoded JSON responses, adding database I/O introduces serialization overhead, connection pooling limits, and CPU boundaries that adjust expectations.
+
+Stack Overflow +1
+
+---
+
+What Drives Your Actual RPS?
+
+| Performance Tier | Expected RPS | System Traits & Setup |
+| :-- | :-- | :-- |
+| **The Baseline (Average Python Setup)** | **150 – 300 RPS** | Standard `SQLAlchemy 2.0` (async) or `SQLModel`, automated `Pydantic v2` model validation on output, and default `Uvicorn` setup. |
+| **Optimized Tier (Production Tuned)** | **400 – 1,000 RPS** | Raw SQL queries via raw `asyncpg`, tuned database connection pools, minimized Pydantic validation on payloads, and using raw JSON responses instead of large ORM objects. |
+
+---
+
+⚠️ Crucial Bottlenecks for a 1-Core System
+
+1. **The Single-Worker Limit & The GIL:**<br />Because you only have **1 CPU core**, you should only run **1 Uvicorn worker process**. Spawning multiple workers on a single core will force the operating system into aggressive context-switching, actually _degrading_ your performance.
+   Reddit +1
+2. **Pydantic Validation (The Real CPU Hog):**<br />In FastAPI, the database query itself is usually fast because it relies on non-blocking async network I/O. The hidden bottleneck is **Python converting the database response rows into Pydantic models**, which completely pegs the single CPU core.
+   Reddit +2
+3. **Writes vs. Reads:**
+   - **Reads** are faster (typically ~400–1,000 RPS) because databases scale well with concurrent reads.
+   - **Writes** drop performance (~150–400 RPS) because your application must await database lock constraints, transactions, and index updates.
+     Medium +1
+
+---
+
+How to Guarantee 1,000+ RPS on this Hardware
+
+If your application needs to reliably scale to the higher edge of this range, adopt these optimizations:
+
+- **Use raw** `asyncpg `**for queries:** Avoid heavy ORM abstraction features where speed is critical. Using raw SQL with `asyncpg` is up to 3x faster than traditional sync drivers.
+  Medium +1
+- **Pre-scale your connection pool:** Set your pool size statically (e.g., `min_size=10`, `max_size=20`) inside your `lifespan` event so FastAPI doesn't waste CPU cycles establishing connections mid-flight.
+  Medium
+- **Return raw dictionaries or** `Response `**objects:** For hot paths, skip the `response_model` argument in your route definitions. Returning a standard dictionary directly tells FastAPI to skip deep Pydantic validation parsing, saving valuable CPU cycles.
+
+To help narrow down your target, what **database engine** are you using (PostgreSQL, MySQL, SQLite), and are you currently using an **ORM like SQLAlchemy or SQLModel**?
+
+Copied to clipboardFailed to copy to clipboard. Try again later.
+
+CopiedFailed to copyCopy
+
+# Share public link
+
+This public link shares a thread, which may include personal information. You can [delete](https://support.google.com/websearch/answer/16517651) this link, but not copies made by others.
+
+Copy link
+
+Can’t copy the link right now. Please try again later.
+
+Facebook
+
+Gmail
+
+X
+
+Reddit
+
+WhatsApp
+
+Share
+
+Good response
+
+Bad response
+
+More
+
+Export to Docs
+
+Draft in Gmail
+
+About this response
+
+Saved time
+
+Clear
+
+Helpful
+
+Comprehensive
+
+Other
+
+Incorrect
+
+Inappropriate
+
+Not working
+
+Unhelpful
+
+Other
+
+A copy of this chat will be included.
+
+A copy of this chat and the content that you shared will be included.
+
+A copy of this chat and the content that you shared will be included.
+
+Submit
+
+Thanks for letting us know
+
+Google may use account and system data to understand your feedback and improve our services, subject to our [Privacy Policy](https://policies.google.com/privacy) and [Terms of Service](https://policies.google.com/terms). For legal issues, [make a legal removal request](https://support.google.com/legal/answer/3110420).
+
+# Shared
+
+0 files
+
+Medium
+
+Asyncio Mastery: Scaling FastAPI to 10k+ RPS in 2025
+
+Architecture Patterns for High Throughput \* Connection Pooling: Your First Bottleneck Database connections are expensive. Creating...
+
+Stack Overflow
+
+FastAPI Insert Performance: 1-2 ms Per Insert
+
+FastAPI Insert Performance: 1-2 ms Per Insert - Is This Normal? Ask Question Asked 2 years, 1 month ago Modified 2 years, 1 month ...
+
+Medium
+
+FastAPI: The Surprising Performance Workhorse That Gives Rust a ...
+
+FastAPI, when set up correctly, can deliver shockingly strong performance — strong enough to satisfy most production workloads and...
+
+Show all
+
+Medium
+
+Asyncio Mastery: Scaling FastAPI to 10k+ RPS in 2025 - Medium
+
+This guide distills years of production experience into actionable patterns that actually work at scale. The Async Fundamentals Th...
+
+Medium
+
+Asyncio Mastery: Scaling FastAPI to 10k+ RPS in 2025
+
+Architecture Patterns for High Throughput \* Connection Pooling: Your First Bottleneck Database connections are expensive. Creating...
+
+Stack Overflow
+
+FastAPI Insert Performance: 1-2 ms Per Insert
+
+FastAPI Insert Performance: 1-2 ms Per Insert - Is This Normal? Here's the simplified code for the insert operation: [app.py](http://app.py) import...
+
+Stack Overflow
+
+FastAPI Insert Performance: 1-2 ms Per Insert
+
+FastAPI Insert Performance: 1-2 ms Per Insert - Is This Normal? Ask Question Asked 2 years, 1 month ago Modified 2 years, 1 month ...
+
+Medium
+
+FastAPI: The Surprising Performance Workhorse That Gives Rust a ...
+
+FastAPI, when set up correctly, can deliver shockingly strong performance — strong enough to satisfy most production workloads and...
+
+Reddit
+
+Not so much performance improvement when using async : r/FastAPI
+
+Not so much performance improvement when using async DB tops at 80% cpu and 80% ram with ~300 connections. We use connection pooli...
+
+Medium
+
+FastAPI Async vs Sync: Benchmark Results | by Kenan Can
+
+What this means for your app If your routes are I/O-bound (DB queries, HTTP calls, file reads), use async def with an async driver...
+
+Medium
+
+FastAPI Async vs Sync: Benchmark Results | by Kenan Can | Medium
+
+Workloads: I/O point lookup (db_user), pattern search (db_search), mixed database and CPU (mixed_db_cpu). Configuration: 1 and 4 U...
+
+Reddit
+
+How does FastAPI utilize the CPU?
+
+How does FastAPI utilize the CPU? Hosting and deployment I've been running the fastapi app with a single worker uvicorn instance i...
+
+GitHub
+
+Understanding benchmarking and setting up Async (Postgres ...
+
+Description asyncio import async_sessionmaker, create_async_engine from sqlmodel. ext. asyncio. session import AsyncSession async\_
+
+Medium
+
+FastAPI vs Flask vs Django | by Afolabi Ifeoluwa James
+
+In our tests, FastAPI (running on Uvicorn) clearly achieved the highest throughput. \* The Numbers: We saw the /json endpoint hitti...
+
+Medium
+
+What Actually Happens When FastAPI Handles a Request?
+
+Scaling FastAPI Under Load By design, a single Uvicorn worker runs on one OS thread, which means it can utilize only one CPU core.
+
+Reddit
+
+Implementing Async REST APIs in FastAPI with PostgreSQL CRUD
+
+Comments Section \* mtucker502 • 6y ago With 6 uvicorn workers and an async client what happens when you try to create 20k POST/cre...
+
+Show less
+
+Copied
+
+Copy
+
+Edit
+
+if I have 400 RPS support how many active users can I support
+
+### AI Mode reply for if I have 400 RPS support how many active users can I support
+
+With a system capable of handling **400 RPS (Requests Per Second)**, you can support anywhere from **4,000 to 40,000+ Concurrent Active Users**, depending entirely on how frequently their apps or browsers ping your server.
+
+In software architecture, "active users" is split into two categories: **Concurrent Users** (people actively clicking and loading things at the exact same second) and **Daily/Monthly Active Users** (the total pool of users who use your app throughout the day).
+
+---
+
+1. Concurrent Users (At any given second)
+
+A user browsing an app does not send a request every single second. They look at the screen, read, fill out a form, or scroll. This delay is known as **User Think Time**.
+
+- **High-Intensity Apps (Chat, Live Dashboards, Games):** If a user's app sends a request every **2 seconds** (heavy polling), your 400 RPS can sustain **800 simultaneous users**.
+- **Standard Web Apps (E-commerce, Social Feeds):** An average user generates a request roughly once every **5 seconds** while actively clicking around. Your 400 RPS can sustain **2,000 simultaneous users**.
+- **Low-Intensity Apps (Blogs, Document Readers):** If a user only triggers a backend request once every **10 seconds**, your 400 RPS can sustain **4,000 simultaneous users**.
+
+---
+
+2. Translating to Business Metrics (DAU / MAU)
+
+To map 400 RPS to industry standard metrics like **Daily Active Users (DAU)**, we have to look at how traffic spreads across a 24-hour day. Traffic is never perfectly flat; it usually peaks drastically during certain hours of the day (e.g., lunch hour or evening).
+
+Using standard traffic distribution models (where a peak hour handles roughly 10% to 15% of the entire day's traffic):
+
+| Traffic Type | Peak Load Assumption | Total Supported Daily Active Users (DAU) |
+| :-- | :-- | :-- |
+| **Highly Uniform Traffic** | Evenly distributed over the day | **~1.1 Million DAU** |
+| **Standard B2B / SaaS Traffic** | Steady daytime use, quiet nights | **~240,000 to 400,000 DAU** |
+| **Spiky / Consumer Traffic** | Massive surges during specific evening hours | **~100,000 to 150,000 DAU** |
+
+---
+
+The Formula to Calculate Your Exact Match
+
+If you want to plug in your own user analytics behavior, you can use **Little’s Law** adapted for web traffic:
+
+Supported Active Users=System RPS×User Think Time (in seconds)Requests per Page LoadSupported Active Users equals the fraction with numerator System RPS cross User Think Time (in seconds) and denominator Requests per Page Load end-fraction
+
+Supported Active Users=System RPS×User Think Time (in seconds)Requests per Page Load
+
+- _Example:_ If loading a page takes **2 API requests**, and the user waits **6 seconds** before clicking the next page:
+
+  <br />
+  Users=400×62=1,200 concurrent users clicking around at that peak period.Users equals the fraction with numerator 400 cross 6 and denominator 2 end-fraction equals 1 comma 200 concurrent users clicking around at that peak period.
+
+  Users=400×62=1,200 concurrent users clicking around at that peak period.
+
+To give you a highly accurate estimate, tell me:
+
+- What **kind of app** are you building (e.g., e-commerce, mobile app feed, dashboard)?
+- Do you expect your traffic to **spike all at once** (like an email blast or a specific event time), or is it **steady throughout the day**?

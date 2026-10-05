@@ -1,0 +1,20 @@
+---
+title: "Customer Segmentation "
+---
+
+A user group segmentation machine learning model **uses unsupervised clustering algorithms to group users based on shared behavioral, demographic, or transactional patterns**. [[1](https://www.univio.com/blog/machine-learning-and-customer-segmentation-meet-the-perfect-couple/), [2](https://bookdown.org/travis/data_science_for_human_centered_product_design/Project2.html), [3](https://www.youtube.com/watch?v=M1_v8gQjrkE)]
+
+**Popular Machine Learning Algorithms**
+
+- **K-Means Clustering:** Divides users into a fixed number (K) of groups by minimizing the distance between data points and cluster centers.
+- **Hierarchical Clustering:** Builds a multi-level tree of clusters to analyze user segments at various levels of granularity.
+- **DBSCAN:** Finds arbitrarily shaped clusters and handles noise or outlier users effectively.
+- **Gaussian Mixture Models (GMM):** Provides soft clustering where a user belongs to multiple segments with assigned probabilities. [[1](https://medium.com/@deolesopan/customer-segmentation-in-machine-learning-grouping-customers-to-drive-smarter-business-decisions-53422507b03b)]
+
+**Standard Workflow**
+
+1. **Data Collection:** Gather attributes like age, location, purchase history, app usage frequency, or session length.
+2. **Preprocessing:** Clean missing values, encode categorical features, and scale numeric features using `StandardScaler`.
+3. **Dimensionality Reduction:** Use PCA or t-SNE to simplify high-dimensional user data for plotting and analysis.
+4. **Optimal Clusters:** Apply the **Elbow Method** (calculating Within-Cluster Sum of Squares) to find the ideal number of segments.
+5. **Deployment:** Assign cluster labels back to users to power personalized marketing or recommendation engines. [[1](https://www.youtube.com/watch?v=-LGwdrajMZ0&vl=en), [2](https://www.researchgate.net/publication/346055282_User_segmentation_via_interpretable_user_representation_and_relative_similarity-based_segmentation_method), [3](https://www.geeksforgeeks.org/machine-learning/customer-segmentation-using-unsupervised-machine-learning-in-python/), [4](https://www.youtube.com/watch?v=xpHXhkkXdXE), [5](https://machinelearningmastery.com/using-machine-learning-in-customer-segmentation/), [6](https://www.youtube.com/watch?v=M1_v8gQjrkE), [7](https://medium.com/@deolesopan/customer-segmentation-in-machine-learning-grouping-customers-to-drive-smarter-business-decisions-53422507b03b)]

@@ -1,0 +1,108 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "willow",
+  "name": "Ask AI Labs",
+  "colors": {
+    "primary": "#16A34A",
+    "light": "#07C983",
+    "dark": "#15803D"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "pages": [
+      {
+        "group": "Trip @ Scale",
+        "pages": [
+          "user-stats",
+          "fast-api-load-performance",
+          "customer-segmentation",
+          "calculating-time-to-run-a-pipleine",
+          "tag-clustering-algorithm",
+          "user-usage",
+          "rags"
+        ]
+      },
+      {
+        "group": "Senior SDE",
+        "pages": [
+          "hybrid-logical-clocks",
+          "vector-clocks-for-crdt",
+          "sequential-database-scan",
+          "optimizing-redia-via-lua-script"
+        ]
+      },
+      {
+        "group": "Data Structures",
+        "pages": [
+          "index",
+          "quickstart",
+          "stack",
+          "segment-tree-in-python",
+          "searning-in-a-bst",
+          "fenwick-tree-and-segment-tree",
+          "quick-hard-concept-video-this",
+          "dynamic-programming-001"
+        ]
+      },
+      {
+        "group": "Forward Deployment Engineer",
+        "pages": [
+          "caching-llm-chats-to-quick-answer-user-query-without-rag",
+          "what-to-expect-in-fde-gen-ai-roles",
+          "sample-resume",
+          "why-need-rag-if-gemini-can-answer",
+          "latest-terms-in-gen-ai-30-sep",
+          "scalablae-vector-database",
+          "case-stude",
+          "data-size-estimation",
+          "complete-rag-tutorial"
+        ]
+      },
+      {
+        "group": "Interview Experience",
+        "pages": [
+          "interivew-data"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:support@mintlify.com"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Dashboard",
+      "href": "https://app.mintlify.com"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/mintlify",
+      "github": "https://github.com/mintlify",
+      "linkedin": "https://linkedin.com/company/mintlify"
+    }
+  },
+  "icons": {
+    "library": "lucide"
+  }
+}

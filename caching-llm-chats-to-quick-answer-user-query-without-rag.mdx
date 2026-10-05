@@ -1,0 +1,54 @@
+---
+title: "Caching LLM Chats to quick answer user query without RAG"
+---
+
+To share an LLM chat cache across multiple users, you must **use Automatic Prefix Caching (APC) on a self-hosted serving engine like vLLM or share a Cloud Provider Cache ID (such as Gemini Context Caching) for managed APIs**. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg), [2](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+
+You cannot manually copy raw GPU memory cache files between distinct user sessions, but you can configure your infrastructure so multiple users automatically hit the same precomputed token blocks.
+
+---
+
+**Method 1: Local Inference with vLLM (Automatic Prefix Caching)**
+
+When hosting an open-source model locally or on your own cloud GPUs, vLLM automatically caches the Key-Value (KV) blocks of shared prompts (like long system instructions or base documents) across different incoming user requests. [[1](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+
+- **Enable APC on startup:** Launch your vLLM server with the `--enable-prefix-caching` flag. [[1](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+
+  **bash**
+  ```text
+  python -m vllm.entrypoints.openai.api_server \
+      --model Qwen/Qwen2.5-7B-Instruct \
+      --enable-prefix-caching
+  ```
+  Use code with caution.
+- **How it works for multiple users:** User A and User B send requests that begin with the exact same system prompt or document text. vLLM recognizes the matching token prefix block in GPU memory, skips recomputation (prefill), and serves multiple users from the shared cache. [[1](https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d), [2](https://medium.com/data-science-collective/how-to-build-a-local-llm-chatbot-with-cag-streamlit-vllm-and-smart-context-caching-7e55028439cc)]
+- **Best Practice:** Keep the shared text (system prompt, few-shot examples, or reference data) completely identical and place it at the very beginning of the prompt string for every user request. [[1](https://www.youtube.com/watch?v=j9wVKM89XFU)]
+
+---
+
+**Method 2: Cloud Managed APIs (Vertex AI / Gemini Context Caching)**
+
+If you are using managed cloud APIs like Google Vertex AI, you can create a centralized cache object once and distribute its reference identifier to multiple user calls. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg)]
+
+- **Create a central cache:** Upload your large files or long system prompts to the API to generate a `cache_id`.
+- **Share the Cache ID:** Pass that same `cache_id` in the initialization code for all subsequent user queries.
+
+  **python**
+  ```text
+  # Instead of sending the heavy prompt/file every time, reference the ID
+  model = GenerativeModel.from_cached_content(cached_content=my_cache_id)
+  response = model.generate_content("User specific question here")
+  ```
+  Use code with caution.
+- **How it works for multiple users:** All user requests pointing to that `cache_id` read from the same cloud-stored token memory, reducing processing costs and latency without duplicating data upload. [[1](https://www.youtube.com/watch?v=eAUIanQMJJg)]
+
+---
+
+**Method 3: Application-Level Semantic/Exact Caching (Redis)**
+
+If you want to share previous _responses_ and conversation prompts across users at the application layer rather than the raw GPU level, use a caching proxy or database like Redis. [[1](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view), [2](https://www.youtube.com/watch?v=j9wVKM89XFU)]
+
+- **Exact Match / Semantic Caching:** Hash incoming user queries or run vector similarity searches via a caching layer (such as Redis or Azure Managed Redis). [[1](https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching), [2](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view)]
+- **How it works for multiple users:** When User A asks a common question, the response is saved to Redis. When User B asks a matching or semantically identical question, the application returns the cached LLM answer instantly without hitting the LLM model again. [[1](https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching), [2](https://oneuptime.com/blog/post/2026-01-30-llm-caching-strategies/view)]
+
+If you can tell me whether you are using **local open-source models (like vLLM/Ollama)** or a **cloud API (like OpenAI/Gemini)**, I can provide the exact configuration or code snippet you need.

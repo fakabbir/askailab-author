@@ -1,0 +1,105 @@
+---
+title: "Optimizing Redia Via Lua Script"
+---
+
+In Redis, **Lua scripts are executed atomically on the server**. This ensures that no other client can modify the database while your script is running, eliminating race conditions without requiring complex transactions. [[1](https://redis.io/docs/latest/develop/programmability/eval-intro/), [2](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
+
+Below is an entry point covering a concrete script example, key concepts, and how to execute it.
+
+---
+
+**1. Example**
+
+ **Script: Rate Limiter**
+
+The script below sets a basic rate limiter. It increments a counter for a given key, sets an expiration time on the first access, and returns whether the request is allowed or blocked. [[1](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
+
+**lua**
+
+```text
+-- KEYS[1]: The rate limit key (e.g., "ratelimit:user123")
+-- ARGV[1]: The maximum allowed hits (e.g., 5)
+-- ARGV[2]: The window time in seconds (e.g., 60)
+
+local current = redis.call('GET', KEYS[1])
+
+-- If the key exists and exceeds the max hits, block the request
+if current and tonumber(current) >= tonumber(ARGV[1]) then
+    return 0
+else
+    -- If the key doesn't exist, increment it and set the expiration time
+    local new_value = redis.call('INCR', KEYS[1])
+    if tonumber(new_value) == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    return 1
+end
+```
+
+Use code with caution.
+
+---
+
+**2. Core Concepts**
+
+- `KEYS `**and** `ARGV`: Redis passes parameters into two separate arrays. By convention, all database keys must go in `KEYS`, and plain values (like timeouts, counts, or IDs) go in `ARGV`. **Lua arrays are 1-indexed**. [[1](https://redis.io/docs/latest/develop/programmability/eval-intro/), [2](https://codesignal.com/learn/courses/mastering-redis-transactions-and-efficiency-with-python/lessons/redis-lua-scripting-for-transactions)]
+- `redis.call()`: This function executes any native Redis command within the script environment. [[1](https://www.freecodecamp.org/news/a-quick-guide-to-redis-lua-scripting/)]
+- **Atomicity**: The script blocks everything else while it executes. Keep your scripts short and fast to avoid triggering a `BUSY` error. [[1](https://redis.io/docs/latest/develop/programmability/), [2](https://scalegrid.io/blog/redis-transactions-long-running-lua-scripts/), [3](https://redis.io/docs/latest/develop/programmability/eval-intro/)]
+- **Local Variables**: Always declare variables with the `local` keyword to ensure they remain safely sandboxed within your script context. [[1](https://redis.io/docs/latest/develop/programmability/lua-api/)]
+
+---
+
+**3. How to Run the Script**
+
+**Via Command Line (**`redis-cli`**)**
+
+You can test the script via `EVAL` by passing the script text, the total number of keys, the keys themselves, and any remaining arguments: [[1](https://redis.io/docs/latest/commands/eval/), [2](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/)]
+
+**bash**
+
+```text
+redis-cli --eval rate_limit.lua ratelimit:user123 , 5 60
+```
+
+Use code with caution.
+
+_(Note: When using_ `redis-cli --eval`_, separate your_ `KEYS `_and_ `ARGV `_with a comma surrounded by spaces)._
+
+**Via Python (**`redis-py`**)**
+
+Sending large scripts over the network repeatedly wastes bandwidth. Instead, production applications use `SCRIPT LOAD` to store the script on the server once, then execute it via its unique `SHA1` hash using `EVALSHA`. [[1](https://blog.devgenius.io/lua-scripting-in-redis-for-performance-gain-6ca3970a9125), [2](https://redis.io/blog/bullet-proofing-lua-scripts-in-redispy/), [3](https://redis.io/docs/latest/develop/programmability/eval-intro/)]
+
+**python**
+
+```text
+import redis
+
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+
+lua_script = """
+local current = redis.call('GET', KEYS[1])
+if current and tonumber(current) >= tonumber(ARGV[1]) then
+    return 0
+else
+    local new_value = redis.call('INCR', KEYS[1])
+    if tonumber(new_value) == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    return 1
+end
+"""
+
+# Register and cache the script on the Redis server
+script_object = r.register_script(lua_script)
+
+# Execute the script using 1 key ("user_login:101"), max hits (3), window (10 sec)
+# The library automatically manages EVALSHA for you
+result = script_object(keys=["user_login:101"], args=[3, 10])
+print(f"Allowed: {result}")
+```
+
+Use code with caution.
+
+---
+
+Proactively tell me **what specific problem** you are trying to solve with your Redis Lua script (e.g., conditional updates, atomic counters, complex workflows), or **which programming language** you are using for your backend application, so I can customize the code directly for your architecture.

@@ -1,0 +1,24 @@
+---
+title: "Hybrid Logical Clocks"
+---
+
+Hybrid logical clocks (HLC) **combine physical wall-clock time and logical integer counters to track event causality while staying closely aligned with real-world time**. [[1](https://sookocheff.com/post/time/hybrid-logical-clocks/), [2](https://medium.com/@armironenko/distributed-systems-logical-time-explained-5f97949f180f)]
+
+**How HLCs Work**
+
+- **Physical Component (l):** Tracks the maximum physical time observed either locally (via NTP-synced system time) or from received messages across the network. [[1](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682), [2](https://notes.andymatuschak.org/zNyYBEFKUqVLXYnH9i75cM1)]
+- **Logical Component (c):** Acts as a counter that breaks ties and preserves causality when physical timestamps (l) match between events (such as rapid successive events on the same node or across nodes). [[1](http://www.cse.buffalo.edu/tech-reports/2014-04.pdf), [2](https://sookocheff.com/post/time/hybrid-logical-clocks/)]
+- **Ordering Rule:** A timestamp `(l1, c1)` is smaller than `(l2, c2)` if `l1 < l2`, or if `l1 == l2` and `c1 < c2`. If event A happens-before event B, its HLC value is guaranteed to be smaller. [[1](https://cs.uni-paderborn.de/fileadmin/informatik/fg/ti/Lehre/WS_2016/ADADS/ADA8-LogicalClock.pdf), [2](http://www.cse.buffalo.edu/tech-reports/2014-04.pdf)]
+
+**Why Use HLCs?**
+
+- **Solves Physical Clock Drift:** Pure physical wall clocks drift apart due to hardware imperfections and unreliable network synchronization (NTP), which can invert the order of closely spaced events. [[1](https://hosseinnejati.medium.com/time-and-clocks-in-distributed-systems-physical-vs-logical-clocks-13f702c9857a), [2](https://www.youtube.com/watch?v=V42828wSONE&t=31)]
+- **Fixes Pure Logical Limitations:** Pure logical clocks like [**<u>Lamport timestamps</u>**](https://martinfowler.com/articles/patterns-of-distributed-systems/hybrid-clock.html) track causality cleanly using integers, but they do not correspond to any real-world date or time, making things like TTL expirations or debugging difficult. [[1](https://martinfowler.com/articles/patterns-of-distributed-systems/hybrid-clock.html), [2](https://www.youtube.com/watch?v=V42828wSONE&t=31)]
+- **No Expensive Hardware Needed:** Unlike Google Spanner's [**<u>TrueTime</u>**](https://sergeiturukin.com/2017/06/26/hybrid-logical-clocks.html), which relies on atomic clocks and GPS hardware, HLCs work on standard commodity hardware using standard loose NTP synchronization. [[1](https://medium.com/@armironenko/distributed-systems-logical-time-explained-5f97949f180f), [2](https://hosseinnejati.medium.com/time-and-clocks-in-distributed-systems-physical-vs-logical-clocks-13f702c9857a)]
+
+**Common Applications**
+
+- **Distributed Transactions:** Used in distributed databases like CockroachDB and YugabyteDB to safely order transactions and maintain linearizability. [[1](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682), [2](https://sookocheff.com/post/time/hybrid-logical-clocks/)]
+- **Multi-Version Concurrency Control (MVCC):** Helps engines create globally consistent snapshots without forcing nodes to wait out maximum clock uncertainty windows. [[1](https://sergeiturukin.com/2017/06/26/hybrid-logical-clocks.html), [2](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682)]
+
+If you're building a system, would you like to explore **how to implement an HLC algorithm in code** or look at **how a specific database handles conflict resolution** with it?

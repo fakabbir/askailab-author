@@ -1,0 +1,19 @@
+---
+title: "scalablae vector database"
+---
+
+A scalable vector database is **a specialized data store designed to house, index, and query billions of high-dimensional vector embeddings with sub-100 millisecond response times**. [[1](https://arxiv.org/abs/2505.12524), [2](https://www.truefoundry.com/blog/best-vector-databases), [3](https://medium.com/@amitkharche/vector-databases-choosing-the-right-one-for-scalable-enterprise-genai-0705565ef333)]
+
+**Core Architecture and Mechanics**
+
+- **Embeddings:** Numeric arrays that capture the semantic meaning of unstructured data like text, images, and audio. [[1](https://cloud.google.com/discover/what-is-a-vector-database), [2](https://www.databricks.com/blog/what-is-vector-database)]
+- **ANN Algorithms:** Approximate Nearest Neighbor methods like **HNSW** (Hierarchical Navigable Small World graphs) and **IVF** (Inverted File Index) trade tiny bits of accuracy for massive speed gains. [[1](https://www.truefoundry.com/blog/best-vector-databases), [2](https://cloud.google.com/discover/what-is-a-vector-database)]
+- **Quantization:** Product Quantization (PQ) compresses vectors to reduce memory consumption. [[1](https://www.oracle.com/in/database/vector-database/pinecone/), [2](https://www.oracle.com/ae/database/vector-database/pinecone/)]
+- **Distributed Scaling:** Horizontal partitioning splits massive datasets across multiple independent nodes or pods to process queries in parallel. [[1](https://www.oracle.com/ae/database/vector-database/pinecone/)]
+
+**Top Scalable Contenders**
+
+- **Pinecone:** A fully managed, cloud-native serverless option built for real-time applications without infrastructure overhead.
+- **Milvus:** An open-source, highly distributed system engineered to scale smoothly to billions of vectors with optional GPU acceleration.
+- **Qdrant:** A Rust-powered engine featuring robust payload filtering and high-performance similarity matching.
+- **Weaviate:** An open-source platform offering built-in vectorization and multi-modal search support

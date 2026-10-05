@@ -1,0 +1,24 @@
+---
+title: "Data Size Estimation"
+---
+
+in terms of average wikipedia article length
+
+An average English Wikipedia article contains roughly **720 to 730 words**, which translates to about **1,000 tokens**. [[1](https://en.wikipedia.org/wiki/Wikipedia:Size_in_volumes), [2](https://www.elvex.com/blog/context-length-comparison-ai-models-2026)]
+
+Using this as a benchmark highlights the scale of modern long-context models:
+
+**Model Capacities in Wikipedia Articles**
+
+| **Model Category / Example** | **Context Window (Tokens)** | **Capacity in Average Wikipedia Articles** |
+| :-- | :-- | :-- |
+| **Claude Sonnet 5** / GPT Series | **1 Million** | **~1,000 articles** |
+| **Gemini 3 Pro** / Llama 4 Scout | **10 Million** | **~10,000 articles** |
+| **Older Models** (e.g., Sonnet 3.5 / GPT-4o) | **128K – 200K** | **~130 to 200 articles** |
+
+**What This Looks Like in Practice**
+
+- **Claude Sonnet 5's 1M Window:** You can feed the model roughly **1,000 average Wikipedia articles** at the exact same time. This is equivalent to loading an entire niche encyclopedia or a highly specific, multi-volume subject library into the model's active working memory. [[1](https://digirank.in/claude-models-comparison/)]
+- **The "Featured Article" Exception:** While the _average_ stub or standard article is short, [**<u>Wikipedia:Article size guidelines</u>**](https://en.wikipedia.org/wiki/Wikipedia:Article_size) note that highly detailed "Featured Articles" often range from 3,000 to over 7,000 words (~4,000 to 10,000 tokens). Even if you are analyzing these massive, deeply detailed entries, Claude Sonnet 5 can still process roughly **100 to 250 heavy featured articles** simultaneously. [[1](https://en.wikipedia.org/wiki/Wikipedia:Article_size), [2](https://www.reddit.com/r/theydidthemath/comments/11jvksj/offsite_how_long_would_it_take_to_read_every/)]
+
+Are you planning to build a **knowledge base**, analyze a **specific cluster of articles**, or run a **batch analysis** across multiple documents? Let me know, and I can suggest the best strategy for formatting that data within the context window

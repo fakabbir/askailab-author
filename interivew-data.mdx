@@ -1,0 +1,112 @@
+---
+title: "Interivew Data"
+---
+
+Random page
+
+[https://docs.google.com/document/d/1ddjj9NrnfrTgP06nv_4jNBkMHlMTtQJVhqPIyE8UzG0/edit?tab=t.0](https://docs.google.com/document/d/1ddjj9NrnfrTgP06nv_4jNBkMHlMTtQJVhqPIyE8UzG0/edit?tab=t.0)
+
+```text
+
+Part 1 :- Give the candidate this in-memory sliding-window rate limiter:
+request_log = {"USER_1": []}
+
+def rate_limiter(api_key: str = Depends(verify_api_key)):
+    now = datetime.now()
+    window_start = now - timedelta(seconds=60)
+    request_log[api_key] = [t for t in request_log[api_key] if t >window_start]
+    if len(request_log[api_key]) >= 20:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    request_log[api_key].append(now)
+    return api_key
+"This is a plain def route (not async def), so FastAPI runs it in a thread pool. Under real concurrent load from the same API key, users are occasionally getting more than 20 requests through in a window — on a single pod, no scaling involved. Why, exactly, and what's the minimal fix?"
+
+import concurrent.futures from itertools 
+import repeat 
+import threading 
+import time
+
+Def check_rate_limit():
+	 now = datetime.now()
+    	window_start = now - timedelta(seconds=60)
+    	request_log[api_key] = [t for t in request_log[api_key] if t >window_start]
+  
+    	if len(request_log[api_key]) >= 20:
+        		Return False
+    	Return True
+
+def check_limit(api_key):
+With threading.Lock() as lock:
+Return check_rate_limit(api_key)
+
+request_log = {"USER_1": []}
+def rate_limiter(api_key: str = Depends(verify_api_key)):
+Allowed = check_limit(api_key)
+If Allowed:
+    		return api_key
+raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+Part 2 . "Now implement this properly for a multi-pod deployment using Redis, atomically, as a sliding-window log."
+R1, R2, R3 RL=1
+R3, R1 > POD 1
+		R1 GET API_KEY , = 0, PASS , 1
+R2 ->POD 2
+	       R2 GET API_KEY = 0
+
+REDIS STATE-> 
+Then push on the failure mode: "Why does this need to run as a Lua script via EVAL instead of separate ZREMRANGEBYSCORE / ZCARD / ZADD calls from your app? And: Redis fails over to a replica mid-window that's a few hundred milliseconds behind on replication. What happens to your rate limit accuracy right after failover, and how would you bound the damage without adding synchronous replication latency to every request
+
+
+
+
+
+
+
+Show this:
+EXPLAIN ANALYZE
+SELECT * FROM sessions WHERE user_id = 48213 ORDER BY created_at DESC LIMIT 1;
+
+Seq Scan on sessions  (cost=0.00..184320.00 rows=2000000 width=64) (actual time=0.02..912.4 rows=1 loops=1)
+  Filter: (user_id = 48213)
+  Rows Removed by Filter: 1999999
+
+Planning Time: 0.11 ms
+Execution Time: 912.6 ms
+"A composite index (user_id, created_at DESC) exists on this table. 
+The planner is ignoring it and doing a sequential scan over 2 million rows. The client swears 'it used to use the index.' 
+
+Diagnose, and fix it live — without taking a long lock on a table this size."
+Diagnose Steps:
+Check if the indexing is right
+Check if this is happing for all the request
+Check if this happens at a give time/load
+Check deployment health
+Check if creating separate index on user_id helps
+Make sure the execution is parallel
+
+
+
+
+
+
+
+A1. Multi-Region Design Under a Compliance Constraint (15 min)
+Scenario: "Design a real-time collaborative document editor — Google-Docs style, 500 concurrent users per document, real-time cursor/presence tracking, correct conflict resolution — that must run active-active across two regions (US-East and EU-West) because of EU data-residency requirements. Users in either region can edit the same document simultaneously. The system must survive a full region outage losing no more than a few seconds of confirmed edits, and must keep working (in a degraded but correct way) if the link between regions is partitioned for up to two minutes."
+Push for real depth, not architecture-diagram hand-waving:
+"Which CRDT are you using for the text itself (e.g., RGA, Logoot, a sequence CRDT), and walk me through why concurrent inserts from both regions converge to the same final string on both sides. What are the actual mathematical properties (commutativity, associativity, idempotency) your merge function needs, and where would a naive implementation violate one of them?"
+
+"Cross-region latency is ~120ms, intra-region is ~5ms. Does your chosen CRDT give you causal ordering for presence/cursor updates for free, or do you need something on top — vector clocks, hybrid logical clocks? Justify the choice."
+
+"The link between regions drops for 90 seconds. Both regions keep accepting local edits. When it heals, what exactly happens, in order, to bring both replicas back to a converged state — and is there any edit ordering a user could perceive as 'wrong' even though the system is technically correct?"
+
+Requirement
+Users in either region can edit the same document simultaneously. The system must survive a full region outage losing no more than a few seconds of confirmed edits, and must keep working (in a degraded but correct way) if the link between regions is partitioned for up to two minutes.
+
+Current : AB
+User 1 -> EU
+ABC
+User 2 - >US
+ABD
+
+ABCD
+```

@@ -1,0 +1,43 @@
+---
+title: "Calculating time to run a pipleine"
+---
+
+Calculating time to run a pipleine if for each user i need to do 20 predictions each prediction takes a second and there are 150M users
+
+Running this pipeline sequentially on a single thread will take **3,000,000,000 seconds**, which is approximately **95.06 years**.
+
+### Step-by-Step Calculation
+
+1. **Total Predictions:**
+
+   Total Predictions=150,000,000×20=3,000,000,000 predictions
+2. **Total Time in Seconds:**
+
+   Total Seconds=3,000,000,000×1 s=3,000,000,000 s
+3. **Conversion to Practical Units:**
+   - **Minutes:** 3,000,000,000÷60=50,000,000 minutes
+   - **Hours:** 50,000,000÷60≈833,333.33 hours
+   - **Days:** 833,333.33÷24≈34,722.22 days
+   - **Years:** 34,722.22÷365.25≈95.06 years
+
+### Parallel Execution Runtime
+
+To execute 3 billion predictions in a feasible operational window, the workload must be distributed across parallel workers or parallel inference instances (e.g., via Ray, Spark, or distributed worker pools).
+
+Assuming near-linear scaling and negligible network overhead:
+
+| Parallel Workers / Concurrency | Total Hours | Total Days |
+| :-- | :-- | :-- |
+| **100** | 8,333.33 hrs | ~347.2 days |
+| **500** | 1,666.67 hrs | ~69.4 days |
+| **1,000** | 833.33 hrs | ~34.7 days |
+| **5,000** | 166.67 hrs | ~6.9 days |
+| **10,000** | 83.33 hrs | ~3.5 days |
+| **35,000** | ~23.8 hrs | ~1.0 day |
+| **50,000** | 16.67 hrs | ~16.7 hrs |
+
+### Key Levers to Reduce Runtime
+
+- **Batching Predictions:** Running 20 predictions per user individually adds significant overhead. Grouping the 20 items into a single tensor batch reduces per-item latency from 1000 ms to tens of milliseconds on modern hardware.
+- **Hardware Acceleration (GPU/TPU):** A model requiring 1 second on a CPU core can often run in 5–20 ms on an inference-optimized GPU (e.g., NVIDIA L4 or T4) via TensorRT, ONNX Runtime, or vLLM.
+- **Pre-filtering / Pruning:** Filtering out dormant users or caching static predictions eliminates unnecessary compute before hitting the pipeline.
