@@ -1,0 +1,347 @@
+---
+title: "FastAPI load performance"
+description: "What a 1-core, 4 GB FastAPI service actually serves per second, what sets that ceiling, and how to measure it without fooling yourself."
+---
+import Steps, {Step} from '@site/src/components/Steps';
+
+The question I started with was deliberately narrow: **what RPS can a 4 GB, 1-core CPU FastAPI instance handle for simple async SQL read and write?** The answer I landed on was a band, not a point — **300 to 1,000 requests per second** under optimal configuration — and the useful part of that number is knowing which of the two ends you're actually sitting on and why.
+
+A bare FastAPI route returning a hardcoded JSON object clears **2,000+ RPS on a single core**. The moment you add database I/O you pay for three new things that the empty-route benchmark never touches: **serialization overhead**, **connection-pool limits**, and a hard **CPU boundary** on the one core you're allowed to use. Everything below is about which of those three binds you first.
+
+## The two performance tiers
+
+| Tier | Expected RPS | What the stack looks like |
+| :-- | :-- | :-- |
+| **Baseline** (average Python setup) | **150 – 300** | `SQLAlchemy 2.0` async or `SQLModel`, `Pydantic v2` validation on every output model, default `Uvicorn` settings |
+| **Optimized** (production-tuned) | **400 – 1,000** | Raw SQL through `asyncpg`, tuned pool sizes, Pydantic validation minimized on hot payloads, raw JSON responses instead of large ORM objects |
+
+Reads and writes are not in the same band. **Reads run about 400–1,000 RPS** because databases scale well with concurrent readers. **Writes fall to roughly 150–400 RPS** because each one awaits lock constraints, a transaction commit, and index updates. A mixed 50/50 workload sits closer to 300–600 than to either extreme, and if your traffic is write-heavy you should budget for the low end.
+
+Two questions decide which number is yours: **which database engine** (PostgreSQL, MySQL, SQLite) and **whether you're on an ORM** like SQLAlchemy or SQLModel. An ORM plus a write-heavy workload plus a 1-core pod is the worst combination in the table above, and it lands you near 150 RPS.
+
+## What actually runs your request
+
+A single `uvicorn` worker is **one OS thread running one event loop on one core**. That one sentence explains most of the tuning:
+
+- **The loop is single-threaded.** A handler that returns control quickly costs almost nothing in wall-clock terms; a handler that holds it is a stop-the-world event for every other in-flight request.
+- **The GIL is not your bottleneck at this scale — the loop is.** With one core, multiple processes buy you nothing.
+- **`uvloop`** (installed with `uvicorn[standard]`) swaps the stdlib selector loop for a libuv-based one and typically buys 10–30 percent more loop iterations per second. It's free, so take it, but it won't rescue a serialization-bound app.
+- **A sync `def` endpoint does not run on the loop.** FastAPI hands it to the Starlette/anyio threadpool, default capacity **40 worker threads** — a ceiling you hit long before the core's.
+- **Worker count equals core count.** On a 1-core instance that means exactly **one Uvicorn worker**; more workers on one core force aggressive context-switching and measurably *degrade* throughput.
+
+The consequence of the single-loop design is that throughput is bounded by `min(CPU-time-per-request, event-loop overhead, pool concurrency, DB latency)`, and on a 1-core box the CPU term almost always wins.
+
+## Sync vs async under load: I measured it
+
+I built a route that simulates 50 ms of blocking I/O twice — once as `async def` with `await asyncio.sleep(0.05)`, once as plain `def` with `time.sleep(0.05)` — and offered it 64 concurrent requests.
+
+| Handler | Total RPS | p50 | p99 | Server CPU |
+| :-- | :-- | :-- | :-- | :-- |
+| `async def` + `await` | **1,191** | 52.5 ms | 71 ms | 17% |
+| `def` + blocking sleep | **741** | 86 ms | 144 ms | 16% |
+
+The arithmetic predicts this almost exactly. Async: 64 concurrent slots at 52.5 ms each is about 1,217 RPS — the loop never waits, so throughput scales linearly with offered concurrency. Sync: the threadpool only has **40** slots, so 64 in-flight requests means each thread runs 1.6 requests *in series*, which is precisely the p50 jump from 50 ms to 86 ms, and precisely the 40 / 0.05 s = 800 RPS theoretical cap the measured 741 sits just under.
+
+So the honest framing is this: **async does not make a single request faster. It makes the server's concurrency the thing you get to choose.** At low offered load (8 concurrent per client, three clients) sync and async were indistinguishable at 145–150 RPS per client, and the sync server cost slightly more memory — 32.5 MB resident versus 29.0 MB — because those threadpool threads have stacks. The gap only opens when you push past 40 simultaneous requests, and then it opens hard.
+
+The corollary is the trap: if you call a sync driver (`psycopg2`, `sqlite3`, `requests`) from an `async def` handler, you block the one loop and every other request queues behind it. My `/mixed` endpoint does 2,000,000 integer adds inside an async handler for exactly this reason — pure CPU work in a coroutine is the same footgun as blocking I/O there.
+
+## The serialization tax
+
+In FastAPI the database query is usually *not* the slow part — it's non-blocking network I/O, and the loop happily runs other requests while it's outstanding. The hidden cost is Python converting response rows into models and then into JSON, on a single pegged core.
+
+I measured the three serialization paths directly, on a 500-row result set, as pure CPU time per response:
+
+| Path | ms per response |
+| :-- | :-- |
+| Return plain dicts, no `response_model` (FastAPI runs `jsonable_encoder`) | **1.58** |
+| `response_model=list[Event]` (Pydantic v2 validate + Pydantic serialize) | **0.81** |
+| Return an explicit `JSONResponse` (FastAPI does nothing) | **0.19** |
+
+At 20 rows the difference is below my noise floor — my A/B of the small-payload hot path versus the validated path gave 540 vs 502 RPS in one run and 429 vs 478 in another, i.e. no signal. At 500 rows it dominates.
+
+This is where I have to be careful with the standard advice, "drop `response_model` to save CPU." The direction is right — **do not validate large payloads through Pydantic on a hot path** — but the reason is subtler than "Pydantic is slow." With no `response_model`, FastAPI still walks your return value through `jsonable_encoder`, and that pure-Python recursive walk is *slower* than Pydantic v2's compiled Rust serializer. Returning raw dicts doesn't remove the tax; it changes who charges it. **The only path that skips conversion is returning a `Response` you built yourself** — row 3 of that table, 8x cheaper than row 1. Use `ORJSONResponse` on genuinely hot routes, and `response_model` everywhere a contract and an OpenAPI schema are worth more than 0.6 ms.
+
+## The pool, the connection count, and the write path
+
+Pool sizing is a concurrency budget, not a memory dial. Set it **statically at startup** (in the `lifespan` handler) so you never pay connection establishment mid-request: something like `min_size=10`, `max_size=20` for `asyncpg` is a sane starting point for a 1-core service, and the corresponding `SQLAlchemy`/`SQLModel` knobs are `pool_size` plus `max_overflow` on `create_async_engine` with `async_sessionmaker`.
+
+The relationship to hold: **worker processes × pool max size = database connections**. One worker with `max_size=20` uses 20 connections. Six workers × 20 = 120. The Postgres default `max_connections=100` is a wall you will hit by scaling horizontally without shrinking pools.
+
+Using raw SQL with `asyncpg` is **up to 3x faster than traditional sync drivers**, because you remove both the threadpool hop and the ORM's row-instantiation layer. That is the single biggest lever in the "Optimized" tier. On the write side, a normal single-row insert through FastAPI costs **1–2 ms per insert**, which is expected rather than pathological — it's the round trip and commit, not your Python.
+
+One warning from the field that matches my own curve: a team reported their **database topping out at 80% CPU and 80% RAM with roughly 300 connections**, with connection pooling already in place. Beyond a few hundred open connections, the DB's per-connection memory and scheduling cost becomes the limiter, and adding pool size makes it worse instead of better. If your engine can't serve more concurrent readers, a bigger pool just moves the queue.
+
+## How to measure this without lying to yourself
+
+<Steps>
+  <Step title="Warm up, then time">
+    Run 50–100 throwaway requests first. Bytecode caches, Pydantic core-schema construction, DNS, TCP handshakes and pool fills all land on the first requests and otherwise show up as p99.
+  </Step>
+  <Step title="Know that a closed loop hides latency">
+    A closed-loop generator (N workers, each firing the next request only when the last completes) measures *capacity*. As the server slows, offered load drops with it and latency damage disappears — coordinated omission. Add a fixed-rate run if you care about p99 at peak.
+  </Step>
+  <Step title="Ramp concurrency, don't set it once">
+    Sweep 1, 8, 24, 64 concurrent and record RPS plus p50, p95, p99 for each. You're looking for the **knee**: where RPS stops rising and p99 starts climbing. Serve at 60–70 percent of that RPS.
+  </Step>
+  <Step title="Prove the client isn't the ceiling">
+    This is the mistake I made first. My single `httpx` generator process topped out near **1,000 RPS** against an idle server, and its measured throughput *fell* as I raised its own concurrency (1,045 at 8 concurrent, 502 at 50, 290 at 100). The client is a Python process too. Run several — my 3-client test reached 2,172 RPS where one client managed 1,045 — or use a native generator (`wrk`, `hey`, `vegeta`, `k6`).
+  </Step>
+  <Step title="Attribute the limit">
+    Sample server CPU during the run. A worker pinned near 100 percent means CPU-bound: fix serialization or add cores. Low CPU with flat RPS means you're waiting on the database, the pool, or the threadpool's 40 slots.
+  </Step>
+</Steps>
+
+## The code
+
+Two files. The app has six routes that isolate the variables discussed above; the generator reports throughput and percentiles. I ran these on Python 3.14, FastAPI 0.142, and Uvicorn 0.54.
+
+```python
+import asyncio
+import time
+from contextlib import asynccontextmanager
+
+import aiosqlite
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+DB_PATH = "./bench.db"
+BIG_SQL = "SELECT id, user_id, payload FROM events ORDER BY id DESC LIMIT ?"
+
+
+class Event(BaseModel):
+    id: int
+    user_id: int
+    payload: str
+
+
+class Pool:
+    """Fixed-size pool, built once at startup, never mid-request."""
+
+    def __init__(self, path: str, size: int):
+        self.path, self.size = path, size
+        self._q: asyncio.Queue = asyncio.Queue(size)
+
+    async def open(self):
+        for _ in range(self.size):
+            conn = await aiosqlite.connect(self.path)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS events "
+                "(id INTEGER PRIMARY KEY, user_id INTEGER, payload TEXT)"
+            )
+            await conn.commit()
+            self._q.put_nowait(conn)
+
+    async def close(self):
+        while not self._q.empty():
+            await self._q.get().close()
+
+    def acquire(self):
+        return self._q.get()
+
+    def release(self, conn):
+        self._q.put_nowait(conn)
+
+
+pool = Pool(DB_PATH, size=8)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await pool.open()
+    yield
+    await pool.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def fetch(limit: int):
+    conn = await pool.acquire()
+    try:
+        cur = await conn.execute(BIG_SQL, (limit,))
+        rows = await cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        pool.release(conn)
+
+
+# 1. small result, no response_model
+@app.get("/read/hot")
+async def read_hot():
+    return await fetch(20)
+
+
+# 2. large result through Pydantic
+@app.get("/read/validated", response_model=list[Event])
+async def read_validated():
+    return await fetch(500)
+
+
+# 3. large result, FastAPI does no conversion at all
+@app.get("/read/raw")
+async def read_raw():
+    return JSONResponse(await fetch(500))
+
+
+# 4. blocking work in a SYNC handler: the anyio threadpool, 40 slots by default
+@app.get("/slow/sync")
+def slow_sync():
+    time.sleep(0.05)
+    return {"ok": True}
+
+
+# 5. the same latency budget, expressed asynchronously
+@app.get("/slow/async")
+async def slow_async():
+    await asyncio.sleep(0.05)
+    return {"ok": True}
+
+
+# 6. CPU-bound work inside an async handler: blocks the one loop
+@app.get("/mixed")
+async def mixed():
+    total = 0
+    for i in range(2_000_000):
+        total += i
+    return {"ok": total > 0}
+```
+
+```python
+import asyncio
+import statistics
+import sys
+import time
+
+import httpx
+
+BASE = "http://127.0.0.1:8000"
+
+
+async def worker(client, path, deadline, lat, errors):
+    while time.monotonic() < deadline:
+        start = time.perf_counter()
+        try:
+            r = await client.get(path)
+            r.raise_for_status()
+            lat.append((time.perf_counter() - start) * 1000)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+
+async def run(path, concurrency, duration):
+    limits = httpx.Limits(max_connections=concurrency,
+                          max_keepalive_connections=concurrency)
+    async with httpx.AsyncClient(base_url=BASE, limits=limits, timeout=10.0) as client:
+        lat, errors = [], []
+        deadline = time.monotonic() + duration
+        # warmup, untimed
+        await asyncio.gather(*(client.get(path) for _ in range(30)))
+        await asyncio.gather(
+            *(worker(client, path, deadline, lat, errors) for _ in range(concurrency))
+        )
+
+    lat.sort()
+    if not lat:
+        print("all requests failed:", errors[:3])
+        return
+    q = int(0.99 * (len(lat) - 1))
+    print(
+        f"{path:16} conc={concurrency:3} rps={len(lat) / duration:8.1f} "
+        f"p50={statistics.median(lat):6.2f}ms p99={lat[q]:6.2f}ms "
+        f"fail={len(errors)}/{len(lat) + len(errors)}"
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(run(
+        sys.argv[1] if len(sys.argv) > 1 else "/read/hot",
+        int(sys.argv[2]) if len(sys.argv) > 2 else 50,
+        float(sys.argv[3]) if len(sys.argv) > 3 else 10.0,
+    ))
+```
+
+Run it with exactly one worker, because that is the topology under discussion:
+
+```bash
+pip install "fastapi[standard]" aiosqlite httpx
+python -m uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1 --loop uvloop
+
+# concurrency sweep, one client process (watch it saturate)
+for c in 1 8 24 64; do python loadgen.py /read/hot $c 10; done
+
+# the sync-vs-async comparison: 8 clients x 8 concurrent = 64 offered
+for i in $(seq 8); do python loadgen.py /slow/async 8 5 & done; wait
+for i in $(seq 8); do python loadgen.py /slow/sync 8 5 & done; wait
+```
+
+My machine is a 12-core arm64 host, **not** the 1-core/4 GB target, so treat these as a sanity check of the shape rather than the answer. Every row below came from the two files above, run verbatim, one Uvicorn worker with `--loop uvloop`, one client process at 8 concurrent:
+
+| Route | Work per request | RPS | p50 | p99 |
+| :-- | :-- | :-- | :-- | :-- |
+| `/read/hot` | 20 rows, no `response_model` | **1,038** | 3.8 ms | 15.2 ms |
+| `/read/raw` | 500 rows, explicit `JSONResponse` | **171** | 52.1 ms | 71.2 ms |
+| `/read/validated` | 500 rows through `response_model` | **137** | 58.0 ms | 100.4 ms |
+| `/mixed` | 2,000,000 integer adds, no I/O | **23** | 245.5 ms | 531.9 ms |
+
+Three things fall out of it. Payload size, not request count, sets your ceiling: the same query at 500 rows instead of 20 costs 6–8x throughput, so a "what's my RPS" question is unanswerable without a response shape. `JSONResponse` beat the Pydantic path by 24 percent on the identical 500-row result, confirming that the win comes from skipping conversion, not from skipping one converter in particular. And `/mixed` is the loop-blocking case made visible: 23 RPS means the eight concurrent clients were served strictly one at a time, 43 ms of serialized CPU each, which is what happens when you put CPU work (or a sync driver call) inside `async def`.
+
+Scale the per-request CPU numbers to your core, not the absolute RPS.
+
+## Turning RPS into users
+
+Active users is two different questions. **Concurrent users** are the ones clicking at the same second; **DAU/MAU** is the pool that generates them. Little's Law adapted for web traffic gives you the first:
+
+```text
+supported concurrent users = (system RPS x user think time in seconds) / requests per page load
+```
+
+A user does not send a request every second — they read, scroll, and fill in forms. That delay is **user think time**, and it's the entire multiplier:
+
+| App shape | Request every | Concurrent users at 400 RPS |
+| :-- | :-- | :-- |
+| High-intensity (chat, live dashboards, games) | 2 s | **800** |
+| Standard web (e-commerce, social feeds) | 5 s | **2,000** |
+| Low-intensity (blogs, document readers) | 10 s | **4,000** |
+
+Worked example with page load cost included: 2 API requests per page and a 6-second pause between pages gives (400 × 6) / 2 = **1,200 concurrent users** at peak.
+
+To reach DAU, spread those requests over a day. Traffic is never flat — a **peak hour typically carries 10–15% of the day's total** — so the 400 RPS headroom is only available for a slice of the day:
+
+| Traffic type | Peak load assumption | Supported DAU |
+| :-- | :-- | :-- |
+| **Highly uniform** | Evenly distributed across 24 h | **~1.1 million DAU** |
+| **Standard B2B / SaaS** | Steady daytime, quiet nights | **240,000 – 400,000 DAU** |
+| **Spiky consumer** | Massive evening surges | **100,000 – 150,000 DAU** |
+
+The uniform case is the arithmetic to trust: 400 RPS × 86,400 s = 34.56 million requests/day, and at ~30 requests per user-day that is about 1.1 million DAU. The spiky rows apply a 10–15% peak-hour concentration factor on top, which is why they collapse to a tenth. At the top of the band, 400 RPS of measured capacity supports **4,000 to 40,000+ concurrent active users** depending on how aggressively their clients poll — before you buy anything, check whether your mobile app's heartbeat is the thing setting that rate.
+
+## Sizing the pod from these numbers
+
+For the 1-core/4 GB envelope: set `requests.cpu` and `limits.cpu` to 1 core and run **one Uvicorn worker**. Worker RSS in my runs was about 30 MB, but a real SQLAlchemy-plus-ORM process is more like 150–400 MB, and each worker is a *separate* copy of that, so 4 GB divided by worker RSS is your worker ceiling regardless of anything else in this article. Keep `requests.memory` equal to `limits.memory` so a serialization-heavy response can't get the pod evicted, set `--limit-concurrency` just above your measured knee so excess load sheds as a 503 instead of becoming 3-second p99s, and give `terminationGracePeriodSeconds` enough room for the loop to drain in-flight requests on SIGTERM.
+
+If you autoscale on CPU, remember a CPU-bound worker pins one core well before it reaches its RPS ceiling — a 60 percent CPU target on a 1-core pod is roughly 240 RPS of the 400 you measured. Autoscale on requests-per-second-per-pod from your own knee test instead.
+
+:::warning
+The 300–1,000 RPS band assumes the database is not on the same 1 core. Colocate Postgres with FastAPI on a single-core box and both compete for the same serialization work; the DB side of that fight is what shows up as 80% CPU at a few hundred connections.
+:::
+
+## Sources I read while building this
+
+The pages scraped into this note kept their titles but lost their URLs, so these are citations rather than links. Search the titles:
+
+- **Medium** — *Asyncio Mastery: Scaling FastAPI to 10k+ RPS in 2025*: connection pooling as the first bottleneck at scale
+- **Stack Overflow** — *FastAPI Insert Performance: 1-2 ms Per Insert — Is This Normal?*: the single-insert latency baseline
+- **Medium** — *FastAPI: The Surprising Performance Workhorse That Gives Rust a Run*
+- **Medium (Kenan Can)** — *FastAPI Async vs Sync: Benchmark Results*: an I/O-bound point lookup (`db_user`), a pattern search (`db_search`), and a mixed database-plus-CPU workload (`mixed_db_cpu`) at 1 and 4 Uvicorn workers, concluding that I/O-bound routes should use `async def` with an async driver
+- **Reddit r/FastAPI** — *Not so much performance improvement when using async*: the database topping out at 80% CPU and 80% RAM with about 300 connections under connection pooling
+- **Reddit r/FastAPI** — *How does FastAPI utilize the CPU?* (single-worker Uvicorn) and **Medium** — *What Actually Happens When FastAPI Handles a Request?* (one worker, one OS thread, one core)
+- **Medium (Afolabi Ifeoluwa James)** — *FastAPI vs Flask vs Django*: Uvicorn-served FastAPI taking the highest throughput on the `/json` endpoint
+- **GitHub** — *Understanding benchmarking and setting up async Postgres*: `create_async_engine` and `async_sessionmaker` from `sqlmodel.ext.asyncio.session`
+- **Reddit** — *Implementing Async REST APIs in FastAPI with PostgreSQL CRUD*: 6 Uvicorn workers and an async client against 20k POSTs
+
+Related: [user usage](/user-usage) for the DAU-side arithmetic and [data size estimation](/data-size-estimation) for sizing storage under this load.

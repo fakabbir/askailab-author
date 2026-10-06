@@ -1,0 +1,98 @@
+---
+title: "User Stats"
+description: "How I turn Tripadvisor's public traffic numbers into concrete capacity math for model serving and user profiling."
+---
+When I size an ML platform for a consumer product, I rarely have an official load report. What I have is public traffic data and a handful of engineering rules of thumb. This article is how I convert one into the other using Tripadvisor's numbers as the worked example, then push them through the capacity math that follows: per-pod headroom, peak-load pod counts, model-fleet sizing, and the memory/CPU budget for profiling 150-200M users.
+
+## What the public metrics actually tell me
+
+Tripadvisor does not publish an official, exact Daily Active User (DAU) figure. It measures engagement through [monthly metrics (Review42)](https://resources.review42.com/tripadvisor-statistics/), so every "active user" number you see online is an estimate derived from traffic, not a disclosed count. That distinction matters when I plan capacity: a public estimate has a range attached to it, and I plan against the top of the range.
+
+Here are the four metrics I anchor on, and how much I trust each.
+
+### Monthly unique users
+
+Roughly **400 million to 460 million** people visit the [Tripadvisor platform](https://www.tripadvisor.com/business/about) each month ([WiserReview](https://wiserreview.com/blog/tripadvisor-statistics/)). "Unique users" is a deduplicated browser/device count over a month, so it is the broadest denominator and the noisiest: cookie deletion, shared devices, and consent banners all inflate or deflate it. I treat it as an upper bound on how many *profiles* could exist, not a load signal.
+
+### Monthly website visits
+
+The core website averages roughly **74 million to 106 million visits** per month depending on seasonal travel trends ([Semrush](https://www.semrush.com/website/tripadvisor.com/overview/), [Statista](https://www.statista.com/topics/3443/tripadvisor/)). This is my real load signal. A "visit" is a session, which is closer to a unit of work hitting the backend than a unique user is. For the arithmetic below I use the top of the range, **106.83M visits/month**, which matches the figure I use on [User usage](/user-usage) and works out to about **3.56M visits per day**.
+
+### Registered accounts
+
+The platform holds nearly **490 million registered member accounts**, but most people interact through web search rather than daily app logins ([Business of Apps](https://www.businessofapps.com/data/tripadvisor-statistics/), [GetCoAI](https://getcoai.com/news/tripadvisor-pivots-to-daily-app-as-google-ai-threatens-search-traffic/), [WiserReview](https://wiserreview.com/blog/tripadvisor-statistics/)). Registered accounts are a *stock*, not a *flow*. A dormant account consumes storage but generates almost no requests, so I never drive request-per-second math off it. I do drive profiling storage off it, which is where the 150-200M number enters.
+
+### The engagement shift
+
+Tripadvisor has actively pivoted toward increasing daily logged-in mobile-app behavior to counter shifts in traditional search traffic ([GetCoAI](https://getcoai.com/news/tripadvisor-pivots-to-daily-app-as-google-ai-threatens-search-traffic/)). For capacity planning this is the one trend that raises both peak concurrency *and* profile-update frequency, because a logged-in app session is heavier per second of attention than an anonymous search-driven page view.
+
+:::note
+When public data is all you have, separate the *flow* metrics (visits, sessions) from the *stock* metrics (registered accounts). Flow drives request rate; stock drives stored state. Conflating them is the most common way these estimates go wrong.
+:::
+
+## From traffic to requests per second
+
+Rules of thumb I use for the three facts at the top of my notes:
+
+- **Most models would take 0.5-10 RPS.** A single inference pod serving a real model (not a stub) sustains somewhere between half a request and ten requests per second, depending on model size, sequence length, and batching.
+- **A production 4 GB / 1 CPU pod handles ~400 RPS.** This is the web/serving layer doing light JSON and simple SQL work, which is consistent with the optimized tier on [FastAPI load performance](/fast-api-load-performance).
+- **Total registered users to profile is 150-200M.** Not the full 490M, because I only build rich profiles for accounts with enough signal to be worth profiling.
+
+I turn 106.83M visits/month into a peak request rate:
+
+1. Daily visits: `106.83M / 30 = 3.56M visits/day`.
+2. Average, perfectly flat: `3.56M / 86,400 s ≈ 41 RPS` of visits (one model-relevant request per visit).
+3. Peak hour: consumer traffic concentrates. Using the 10-15% peak-hour assumption from [FastAPI load performance](/fast-api-load-performance), a peak hour carries about `3.56M × 0.12 ≈ 427K visits`, or `427K / 3,600 ≈ 118 RPS` of visits.
+4. Fan-out: a single visit usually triggers several backend calls. At roughly 10 API requests per visit, peak API load is on the order of **1,200 RPS**.
+
+So two different "peaks" matter: **~118 RPS** if a model runs once per visit, and **~1,200 RPS** at the HTTP layer if every request is served.
+
+## Per-pod headroom and how many pods peak needs
+
+The serving layer is cheap. At 400 RPS per 4 GB / 1 CPU pod, **1,200 RPS peak ÷ 400 = 3 pods**. Add one for failure domain (`n+1`), so I would run **4 API pods** and let autoscaling cover the rest. That matches the [FastAPI load performance](/fast-api-load-performance) guidance that reads hold ~400-1,000 RPS and writes drop toward ~150-400 RPS.
+
+The model layer is the bottleneck, and the headroom gap is enormous: an API pod does 400 RPS, a model pod does 0.5-10 RPS. That is a **40x to 800x** difference, so one web pod fronts dozens to hundreds of model pods. Here is the fleet sizing against my two peak scenarios.
+
+| Peak model calls/sec | At 10 RPS/pod | At 1 RPS/pod | At 0.5 RPS/pod |
+| :-- | :-- | :-- | :-- |
+| 118 RPS (one call per visit) | 12 pods | 118 pods | 236 pods |
+| 1,200 RPS (one call per API request) | 120 pods | 1,200 pods | 2,400 pods |
+
+The spread from 12 to 2,400 pods is the entire reason I do not deploy a naive per-request model call. Three levers close the gap:
+
+- **Batching** pushes a model pod up the range toward 10 RPS by packing concurrent requests into one forward pass. See the batching discussion on [Calculating time to run a pipeline](/calculating-time-to-run-a-pipleine).
+- **Caching** removes requests before they reach the fleet; [Caching LLM chats](/caching-llm-chats-to-quick-answer-user-query-without-rag) is the same idea at the answer layer.
+- **Asynchronous queueing** absorbs bursts instead of scaling pods to the absolute peak.
+
+:::warning
+Do not size the model fleet off the *average* 41 RPS. Average load hides the peak-hour concentration, and a serving system that is fine at noon melts at 7pm. Size off peak, then autoscale down off-peak to control cost.
+:::
+
+## Memory and CPU budget for profiling 150-200M users
+
+The profiling number is a storage-and-compute problem, not a request-rate problem. I do the bytes math explicitly: `bytes per user profile × number of users`. To keep it simple I use decimal units (`1 KB = 1,000 bytes`, `1 TB = 1,000 GB`); binary units (KiB/MiB) would be about 7% smaller and I note that difference when I quote GB versus GiB.
+
+| Profile weight | What it holds | 150M users | 200M users |
+| :-- | :-- | :-- | :-- |
+| ~1 KB | Compact numeric features (counts, recency, spend) | 150 GB | 200 GB |
+| ~3 KB | One 768-dim float32 embedding (`768 × 4 = 3,072 B`) | 461 GB | 614 GB |
+| ~10 KB | Features + tags + a few embeddings | 1.5 TB | 2.0 TB |
+| ~100 KB | Rich multi-modal profile with interaction history | 15 TB | 20 TB |
+
+A few conclusions I draw from this table:
+
+- A 1 KB feature profile fits in **a few hundred GB**, so the entire 200M-user set fits in RAM on one beefy node and can be served with single-digit-millisecond lookups. This is the regime where I keep profiles in a key-value store or an in-memory cache.
+- One embedding per user (~3 KB) is **under 1 TB** at both ends of the range, so an ANN index over 200M vectors is feasible but starts to push toward the distributed setups I cover in [Scalable vector database](/scalablae-vector-database).
+- A 10 KB profile at 200M users is **2 TB**; a 100 KB profile is **20 TB**. That crosses from "cache it" to "store it on object storage / a columnar lake and read it lazily." Estimate this before you commit to a profile schema, and cross-check against [Data size estimation](/data-size-estimation).
+
+The CPU side is about *refresh*, not *read*. If a nightly job recomputes profiles at, say, 20 predictions per user, then `150M × 20 = 3B` predictions per run. The runtime math for exactly that workload, including the parallel-worker scaling table, is on [Calculating time to run a pipeline](/calculating-time-to-run-a-pipleine): a single thread needs ~95 years, which is why profiling refreshes are embarrassingly parallel batch jobs, never a synchronous request path.
+
+## How I'd act on this
+
+The public data gives me three load-bearing facts and one design stance:
+
+- Serving is cheap (single-digit pods for the web layer); the model fleet is the real cost, scaling from ~12 to ~2,400 pods depending on how often I call a model and how well I batch.
+- Profiling 150-200M users is a storage decision first: pick the per-user byte budget from the table above, because 1 KB versus 100 KB is the difference between an in-memory cache and a data lake.
+- The engagement shift toward logged-in app sessions is what pushes *both* peak RPS and profile churn upward, so I plan the model fleet and the refresh window against that trend, not the current anonymous-search baseline.
+
+The failure mode to watch is treating "490M registered accounts" and "400-460M monthly uniques" as if they were the same number as the profiling population. They are not, and building a 490M-user profile store when only 150-200M profiles are useful and only ~3.5M/day generate load is how a team ends up paying for a fleet it never saturates.

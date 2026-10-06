@@ -1,0 +1,76 @@
+---
+title: "Customer Segmentation"
+description: "How I group users into segments: the signals, the feature engineering, how I pick and evaluate the clustering method, and how segments get computed offline but served online."
+---
+A user group segmentation model **uses unsupervised clustering algorithms to group users based on shared behavioral, demographic, or transactional patterns** ([Univio](https://www.univio.com/blog/machine-learning-and-customer-segmentation-meet-the-perfect-couple/), [Travis — Data Science for Human-Centered Product Design](https://bookdown.org/travis/data_science_for_human_centered_product_design/Project2.html), [overview talk](https://www.youtube.com/watch?v=M1_v8gQjrkE)). "Unsupervised" is the whole difficulty: there is no label telling me the right segments, so the model finds structure and I have to decide whether that structure is real and useful. This article walks the pipeline I actually run, from signals to a served segment label.
+
+## The signals I start from
+
+Segmentation quality is decided before the model, by what goes into the feature vector. The standard collection gathers attributes like **age, location, purchase history, app usage frequency, and session length**. I organize those into three families, because each pulls out different behavior:
+
+- **Demographic:** age, location, account tenure, plan tier. Stable, coarse, good for reportable personas.
+- **Behavioral:** app usage frequency, session length, active days, feature adoption, recency of last visit. Fast-moving, this is where engagement signal lives.
+- **Transactional:** purchase history, order value, category mix, returns. Directly tied to revenue, usually sparse.
+
+My default behavioral backbone is **RFM** — recency, frequency, monetary — because it is interpretable, cheap, and surprisingly strong. Everything else augments it. The one rule I follow: only use signals I can also compute for a *brand-new* user, or my offline segments will be impossible to assign at signup time.
+
+## Feature engineering
+
+The preprocessing step is mechanical and unforgiving: **clean missing values, encode categorical features, and scale numeric features using** `StandardScaler`. I add the reasoning that makes it hold up:
+
+- **Missing values** are themselves a signal for sparse transactional data. I often fill with a sentinel and add a "was-missing" indicator rather than dropping the user, because "has no purchase history" is a segment, not a bug.
+- **Categorical encoding.** One-hot for low cardinality (country, plan); target/frequency encoding for high cardinality; and for free-text tags, I collapse near-duplicate tags into canonical clusters first — the method is on [Tag clustering algorithm](/tag-clustering-algorithm) — so five spellings of "beach" become one interest feature instead of five diluted ones.
+- **Scaling.** Clustering minimizes distance, so a raw "age" (0-100) will drown a "sessions/day" (0-5). `StandardScaler` z-scores every column to zero mean / unit variance so each feature contributes on its own scale. I do *not* scale binary flags this way; scaling one-hot columns wrecks their meaning.
+- **Binning and derived features.** I convert continuous RFM into quantile bins, add ratios (spend per session, sessions per active day), and sometimes reduce dimensions with **PCA or t-SNE** — but only **to simplify high-dimensional user data for plotting and analysis**, never as a silent pre-step before K-Means on PCA components, which changes which distance I am actually optimizing.
+
+## Choosing the method
+
+Each popular algorithm trades something specific, and I pick against the shape of the data, not familiarity.
+
+- **K-Means Clustering:** divides users into a **fixed number (K) of groups by minimizing the distance between data points and cluster centers**. My default when I need clean, reportable, roughly-equal personas. It assumes convex, isotropic blobs and is sensitive to scaling and outliers.
+- **Hierarchical Clustering:** builds a **multi-level tree of clusters to analyze user segments at various levels of granularity**. When the business wants "broad personas that drill down," this beats K-Means because I cut the dendrogram at whatever depth a stakeholder needs. Costly at scale (`O(n^2)`+).
+- **DBSCAN:** finds **arbitrarily shaped clusters and handles noise or outlier users effectively**. For behavioral data with a huge one-off tail (bots, single-session tourists), DBSCAN's explicit "noise" label is a feature, not a fallback.
+- **Gaussian Mixture Models (GMM):** **soft clustering where a user belongs to multiple segments with assigned probabilities** ([Deolesh Panaskar, Customer Segmentation in ML](https://medium.com/@deolesopan/customer-segmentation-in-machine-learning-grouping-customers-to-drive-smarter-business-decisions-53422507b03b)). When a user genuinely is 60% deal-seeker / 40% researcher, a hard label lies; GMM gives me the mixture and a likelihood threshold for "confident enough to target."
+
+| Method | Knows K? | Handles noise | Output | Reach for it when |
+| :-- | :-- | :-- | :-- | :-- |
+| K-Means | yes (fixed) | no | hard labels | clean equal-sized personas |
+| Hierarchical | no (cut tree) | limited | multi-level labels | drill-down granularity matters |
+| DBSCAN | no (auto) | yes (noise class) | hard + noise | sparse tail, irregular shapes |
+| GMM | yes (components) | partial | soft probabilities | mixed-membership users |
+
+## Finding K and evaluating
+
+The **Elbow Method** — calculating **Within-Cluster Sum of Squares (WCSS)** and looking for the bend where adding a cluster stops cutting distortion much — is the standard way to pick the ideal number of segments. I treat the elbow as a hint, not an answer, because it is frequently a smooth curve with no clean elbow. I triangulate:
+
+- **Silhouette score** across a K range to check separation, and for GMM/DBSCAN the metric changes (no WCSS), which is exactly why I pick the metric after the algorithm.
+- **Stability:** rerun on different days/seed and confirm the same segments survive. A segment that shuffles every night is noise, and no marketer should target it.
+- **Interpretability:** I profile each cluster's feature means. A cluster I cannot describe in one sentence to a business owner is not a segment, it is an artifact.
+- **Business validation:** segments must differ on a metric I care about that was *not* a clustering feature (e.g., later conversion or churn). If they do not, the segmentation is decorative.
+- **Drift:** I monitor population share per segment over time with a PSI-style check, because "the model is fine" and "the users moved" look identical if I am not watching counts.
+
+## Offline computation, online serving
+
+This is where most segmentation projects quietly fail, and it is the part I design first. The heavy clustering **runs offline** — a nightly or weekly batch job over the full population. For a large user base, that batch is exactly the embarrassingly-parallel scoring problem I work through on [Calculating time to run a pipeline](/calculating-time-to-run-a-pipleine), and the storage budget for keeping per-user profiles is on [User stats](/user-stats). The batch job writes `user_id -> segment_id` (and, for GMM, the probability vector) into a key-value store.
+
+**Serving is a separate, online path**, and it has three cases:
+
+1. **Existing user:** at request time I look up the precomputed segment label — a single fast key-value read, not a re-cluster. This is what powers personalized marketing and recommendation engines in the workflow's deployment step.
+2. **Existing user, features changed but before next batch:** if behavior is fast-moving, the offline label is stale. I either accept the staleness for coarse personas, or run a **lightweight online scorer** — a frozen logistic/centroid model that maps the live feature vector to the nearest centroid without touching the batch pipeline.
+3. **New user at signup:** there are no behavioral features yet. Cold-start users go to an explicit "new/unknown" segment and get assigned to a real one only after enough signals accumulate. I never force-cluster a user with two features.
+
+The key mental model: *the cluster model is offline; the assignment can be online.* I persist the trained model (centroids, scaler parameters, PCA basis) so the online scorer reconstructs the exact feature space the model was trained in. A mismatch between offline and online feature computation is the most common reason served segments diverge from the ones I validated.
+
+:::warning
+Never re-fit the clustering inside the serving path, and never let online features drift from the offline definitions. If your offline pipeline z-scores with `StandardScaler` fit on last month's data, the online scorer must reuse those frozen mean/std — recomputing them per request silently changes the distance geometry and renumbers your segments under the marketing team's feet.
+:::
+
+## Failure modes I design against
+
+- **Scaling bugs:** forget `StandardScaler` and monetary values with big magnitudes own the clusters. I check feature means after scaling.
+- **K over-fit to one day:** pick K on a stability window, not a snapshot.
+- **Uninterpretable segments:** a cluster nobody can name never gets used; fold tags and drop features that only add noise.
+- **Stale labels:** offline-only serving for fast-moving behavior serves yesterday's segment; add an online scorer or shorten the batch cadence.
+- **Uneven segments:** with a power-law user distribution, huge hubs distort K-Means centroids; either switch to DBSCAN/GMM or pre-balance with dimensionality reduction.
+
+The standard workflow — collect, preprocess, optionally reduce dimensionality, find the optimal clusters, deploy labels to drive personalization — is well covered end to end ([GeeksforGeeks](https://www.geeksforgeeks.org/machine-learning/customer-segmentation-using-unsupervised-machine-learning-in-python/), [Machine Learning Mastery](https://machinelearningmastery.com/using-machine-learning-in-customer-segmentation/)), with interpretable-representation approaches in the [research literature](https://www.researchgate.net/publication/346055282_User_segmentation_via_interpretable_user_representation_and_relative_similarity-based_segmentation_method), and worked walkthroughs in [video form](https://www.youtube.com/watch?v=-LGwdrajMZ0&vl=en), [here](https://www.youtube.com/watch?v=xpHXhkkXdXE), and again in the [overview talk](https://www.youtube.com/watch?v=M1_v8gQjrkE) — the differentiator between a demo and a shipped system is the offline/online split above and the evaluation discipline before it.

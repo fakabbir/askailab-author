@@ -1,0 +1,303 @@
+---
+title: "Hybrid Logical Clocks"
+description: "How one 64-bit integer gives you both wall-clock time and causal ordering, with the failure modes it exists to prevent and a runnable Python implementation."
+---
+import AccordionGroup, {Accordion} from '@site/src/components/Accordion';
+
+Every distributed system I build eventually has to answer the same boring question: which write is newer? Hybrid logical clocks (HLCs) are my answer, because they are the only timestamp scheme I know that costs eight bytes, survives clock drift, and still means something to a human reading a log at 3 a.m.
+
+An HLC **combines physical wall-clock time and logical integer counters to track event causality while staying closely aligned with real-world time** ([sookocheff](https://sookocheff.com/post/time/hybrid-logical-clocks/), [Armironenko](https://medium.com/@armironenko/distributed-systems-logical-time-explained-5f97949f180f)). That sentence is the whole design goal, and you can see why it is hard by looking at the two pure options it sits between.
+
+## The failure mode of pure wall-clock time
+
+A per-node wall clock is the timestamp you actually want, because it is comparable to reality. But the clocks on different machines disagree. **Pure physical wall clocks drift apart due to hardware imperfections and unreliable network synchronization (NTP), which can invert the order of closely spaced events** ([Hossein Nejatipour](https://hosseinnejati.medium.com/time-and-clocks-in-distributed-systems-physical-vs-logical-clocks-13f702c9857a), [video walkthrough](https://www.youtube.com/watch?v=V42828wSONE&t=31)).
+
+"Invert" is not abstract. In the test I ran below, node A's clock runs 400 ms fast and node B's runs 1,000 ms slow. A writes a row and sends a message that causes B to write a follow-up row. B's write is a causal successor of A's, yet B stamps it with its own wall time, which is 1,400 ms *earlier* than A's stamp. Under last-write-wins the successor loses, A's stale value is the surviving truth, and nothing gets logged as an error.
+
+Real systems put a hard budget on this instead of trusting NTP. **CockroachDB's default maximum clock offset is 500 ms** (reducible to 250 ms with `--max-offset`), rows written with timestamps above a reader's but within the max offset are "considered to be ambiguous", and the engine resolves that by pushing the transaction timestamp and retrying rather than waiting; the guidance is to keep clocks monotonic via NTP slew or smear because a stepped clock means "CockroachDB nodes may spontaneously exit to protect ACID guarantees" ([Clock Management in CockroachDB](https://www.cockroachlabs.com/blog/clock-management-cockroachdb/), [Transaction layer](https://docs.cockroachlabs.com/docs/stable/architecture/transaction-layer)). In the Cassandra family, writes carry microsecond-resolution timestamps assigned by the coordinator or driver and monotonicised by "a counter that gets incremented until the next clock tick"; the ScyllaDB driver watches for skew and logs `Clock skew detected: current tick (...) was ... microseconds behind the last generated timestamp`, then artificially advances timestamps to preserve ordering ([ScyllaDB query timestamps](https://java-driver.docs.scylladb.com/stable/manual/core/query_timestamps/)). A wall clock plus a per-node monotonic counter is the minimum viable HLC, and it exists because raw wall time is unsafe.
+
+## The failure mode of pure logical time
+
+[Lamport timestamps](https://martinfowler.com/articles/patterns-of-distributed-systems/hybrid-clock.html), the pure logical alternative, **track causality cleanly using integers, but they do not correspond to any real-world date or time, making things like TTL expirations or debugging difficult** ([Martin Fowler](https://martinfowler.com/articles/patterns-of-distributed-systems/hybrid-clock.html), [video walkthrough](https://www.youtube.com/watch?v=V42828wSONE&t=31)).
+
+My run makes the loss concrete. Three events whose true wall times are 1,777,000,000,000 ms, +300,000 ms, then +1 ms get Lamport values 1, 2, 3. A five-minute gap and a one-millisecond gap are the same distance in timestamp space: one tick. So `expires_at`, retention windows, age-based compaction and "show me last hour's writes" are all unimplementable on a Lamport clock. A second limitation bites harder in production: a bigger Lamport number does not tell you whether two events were concurrent, so conflict detection needs [vector clocks](/vector-clocks-for-crdt).
+
+## The model: two fields, three update rules
+
+An HLC keeps two values per node ([Buffalo tech report 2014-04](http://www.cse.buffalo.edu/tech-reports/2014-04.pdf)):
+
+- **Physical component (`l`):** tracks the maximum physical time observed either locally (via NTP-synced system time) or from received messages across the network ([GeekCulture deep dive](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682), [Andy Matuschak's notes](https://notes.andymatuschak.org/zNyYBEFKUqVLXYnH9i75cM1)). It is a high-water mark, not a snapshot.
+- **Logical component (`c`):** acts as a counter that breaks ties and preserves causality when physical timestamps (`l`) match between events (such as rapid successive events on the same node or across nodes) ([Buffalo report](http://www.cse.buffalo.edu/tech-reports/2014-04.pdf), [sookocheff](https://sookocheff.com/post/time/hybrid-logical-clocks/)).
+
+The rules I implement:
+
+1. **Local event:** `l' = max(l, pt)` where `pt` is the current physical reading. If the wall clock passed `l`, follow the wall clock and reset `c` to 0; otherwise hold `l` and increment `c`.
+2. **Send:** take a local timestamp, attach `(l, c)` to the message.
+3. **Receive:** `l' = max(l, l_msg, pt)`. Then `c' = max(c, c_msg) + 1` when the new `l'` equals both `l` and `l_msg`; `c + 1` when it equals only `l`; `c_msg + 1` when it equals only `l_msg`; and `0` when it equals only `pt`.
+
+**Ordering rule:** a timestamp `(l1, c1)` is smaller than `(l2, c2)` if `l1 < l2`, or if `l1 == l2` and `c1 < c2`. If event A happens-before event B, its HLC value is guaranteed to be smaller ([ADA8 lecture notes](https://cs.uni-paderborn.de/fileadmin/informatik/fg/ti/Lehre/WS_2016/ADADS/ADA8-LogicalClock.pdf), [Buffalo report](http://www.cse.buffalo.edu/tech-reports/2014-04.pdf)).
+
+Two properties fall out of that rule, and they are why I reach for HLCs:
+
+- **Causal ordering with bounded storage.** `O(1)` time and 8 bytes per timestamp regardless of cluster size. A vector clock buys the same `happens-before` completeness at `O(N)`.
+- **Bounded error against real time.** If every clock is within `δ` of truth, `l` is within `δ` of the true event time, with one caveat: each receive can ratchet `l` forward, so `l` means "not before this wall time" rather than "exactly when it happened". My run shows that ratchet directly — after a 5 s backward step, `l` sits 5,000 ms ahead of real time and only comes back down as the wall clock catches up.
+
+## The encoding, and how the counter borrows
+
+The practical trick is to pack both fields into one machine word so comparison is a single unsigned integer compare — that is what makes an HLC cheap enough to put in an index key or an SSTable. I reserve the low bits of the word for the counter, which means **the counter borrows resolution from the physical field**.
+
+In my implementation the 64-bit word is 48 bits of millisecond wall time plus a 16-bit counter. The arithmetic that matters:
+
+| Layout (physical/logical bits) | Physical unit | Wall-time span | Counter headroom | Events absorbable per tick |
+| :-- | :-- | :-- | :-- | :-- |
+| 64 / 0 (pure wall) | ms | `2^64` ms | 0 | 1 (unsafe under drift) |
+| 48 / 16 (mine) | ms | ~8,919 years | 65,536 | 65.5 M/s |
+| 52 / 12 (YugabyteDB's reported split) | microseconds | ~142,700 years | 4,096 | 4.1 G/s |
+| 44 / 20 | ms | ~557 years | 1,048,576 | 1.05 G/s |
+| 48 / 16 | microseconds | ~8.9 years | 65,536 | 65.5 G/s |
+
+Two things to notice. The split is a real trade: bits given to the counter come out of the physical clock's range or resolution. The write-up I took the 52/12 row from decodes YugabyteDB's HLC with `physical_usec := ht_lsn >> 12` and `logical_counter := ht_lsn & ((1<<12)-1)` ([Peeking into YugabyteDB's HLC](https://yugabytedb.tips/peeking-into-yugabytedbs-hybrid-logical-clock-hlc/)); write-ups of CockroachDB's HLC report 48 bits of millisecond wall time with a 16-bit logical counter, compared as two fields (lexicographic) rather than one packed int, and say a counter overflow panics the node instead of wrapping ([Hybrid Logical Clock in Distributed Systems](https://singhajit.com/distributed-systems/hybrid-clock/)). And if your clock source is finer than your physical field, the borrow shows up as lost precision: carving 16 bits out of a 100 ns tick clock quantises time to `65536 * 100 ns = 6.5536 ms`, while 4 bits costs only 1.6 `µs` ([Bartosz Sypytkowski](https://www.bartoszsypytkowski.com/hybrid-logical-clocks/)).
+
+The dynamic behaviour is the part I want you to be able to reason about under load:
+
+- While `pt` keeps beating `l`, `c` stays 0 and timestamps are honest wall-clock values.
+- When a peer's `l` or a stalled clock pins `l` above `pt`, every subsequent event increments `c`. The physical field is now frozen in the past while the counter absorbs all the ordering work.
+- When `c` exceeds its bit budget it carries: `l += 1`, `c = 0`. The encoded stream stays monotonic, but `l` has silently moved one quantum ahead of real time. Keep hammering a hot key and the physical field becomes fiction, which is why systems with a bounded counter prefer to fail loudly rather than corrupt ordering.
+
+An HLC is a partial order plus a tiebreak. If you need a *total* order (deterministic conflict resolution across replicas, for instance), compare `(packed_hlc, node_id)`; the node id is the last-resort tiebreak and it has to be stable across restarts.
+
+## A runnable implementation
+
+
+```python title="hlc.py"
+LOGICAL_BITS = 16
+LOGICAL_MAX = (1 << LOGICAL_BITS) - 1        # 65535
+LOGICAL_MASK = LOGICAL_MAX
+
+
+class HLC:
+    """48-bit millisecond wall time + 16-bit logical counter in one int64."""
+
+    def __init__(self, node, wall=None):
+        import time
+        self.node = node
+        self._wall = wall or (lambda: int(time.time() * 1000))
+        self.l = 0          # physical high-water mark, ms since epoch
+        self.c = 0          # logical counter, the borrowed low bits
+
+    @staticmethod
+    def unpack(v):
+        return v >> LOGICAL_BITS, v & LOGICAL_MASK
+
+    def stamp(self):
+        return (self.l << LOGICAL_BITS) | self.c
+
+    def now(self):
+        """local event / write"""
+        pt = self._wall()
+        if pt > self.l:                       # wall clock ahead: follow wall time
+            self.l, self.c = pt, 0
+        else:                                 # wall stalled or backwards: borrow c
+            self.c += 1
+        return self._fix_overflow()
+
+    def receive(self, remote_packed):
+        """observe a peer's timestamp, then take one for the causal successor"""
+        pt = self._wall()
+        rl, rc = self.unpack(remote_packed)
+        l_new = max(self.l, rl, pt)
+        if l_new == self.l == rl:
+            c_new = max(self.c, rc) + 1
+        elif l_new == self.l:
+            c_new = self.c + 1
+        elif l_new == rl:
+            c_new = rc + 1
+        else:                                 # l_new == pt, greater than both
+            c_new = 0
+        self.l, self.c = l_new, c_new
+        return self._fix_overflow()
+
+    def _fix_overflow(self):
+        if self.c > LOGICAL_MAX:              # counter carries into the physical field
+            self.l += 1
+            self.c = 0
+        return self.stamp()
+```
+```python title="test_hlc.py"
+class FakeWall:                       # injectable clock: the whole trick
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+BASE = 1_777_000_000_000              # fixed ms epoch so the run is reproducible
+
+# 1. causality across a send/receive with skewed clocks
+a = HLC("node-a", FakeWall(BASE + 400))     # A runs 400 ms FAST
+b = HLC("node-b", FakeWall(BASE - 1000))    # B runs 1000 ms SLOW
+ta = a.now()                                # A writes, then sends
+tb = b.receive(ta)                          # B receives, then writes the successor
+
+# 2. three writes inside one physical millisecond
+frozen = HLC("node-c", FakeWall(BASE))
+seq = [frozen.now() for _ in range(3)]
+
+# 3. counter exhaustion with a frozen wall clock
+stalled = HLC("node-d", FakeWall(BASE))
+for _ in range(LOGICAL_MAX + 1):
+    boundary = stalled.now()             # the last stamp before the carry
+carried = stalled.now()
+
+# 4. payload comparison against a vector clock in a 64-node cluster
+n = 64
+vc = {i: 1000 for i in range(n)}
+
+# 5. monotonicity through a backward NTP step
+w = FakeWall(BASE)
+node = HLC("node-e", w)
+t1 = node.now()
+w.t = BASE - 5000
+t2, t3 = node.now(), node.now()
+
+# --- report: everything above is setup, this prints the output ---
+
+def show(tag, v):
+    l, c = HLC.unpack(v)
+    print(f"{tag:<26} packed={v} l={l} c={c}")
+
+
+print("== 1. send/receive with 1400 ms of clock skew between the nodes ==")
+show("A write (sender)", ta)
+show("B write (receiver)", tb)
+print("HLC says A happened-before B:", ta < tb)
+print("B's own wall clock is 1400 ms behind A's:", BASE - 1000, "vs", BASE + 400)
+inverted = (BASE - 1000) < (BASE + 400)
+print(f"Wall-clock-only ordering would put B 1400 ms BEFORE A: {inverted}   <-- last-write-wins loses B's update")
+
+print("\n== 2. three writes inside one physical millisecond ==")
+for i, v in enumerate(seq, 1):
+    show(f"event {i}", v)
+print("strictly increasing:", seq[0] < seq[1] < seq[2])
+
+print("\n== 3. logical counter overflow with a frozen wall clock ==")
+show("at the boundary", boundary)
+show("one tick later", carried)
+lb, cb = HLC.unpack(boundary)
+print("carried into the physical field (l +1 ms, c reset):", HLC.unpack(carried) == (lb + 1, 0))
+print("packed value still monotonic:", carried > boundary)
+
+print("\n== 4. timestamp payload, 64-node cluster ==")
+import json
+json_bytes = len(json.dumps(vc, separators=(",", ":")).encode())
+print("vector clock: 64 int64 counters =", n * 8, "bytes fixed /", json_bytes, "bytes JSON")
+print("HLC: 8 bytes packed int64 /", len(str(carried)), "bytes decimal text")
+print(f"fixed-width ratio: {(n * 8) // 8}x")
+
+print("\n== 5. monotonic through a backward 5 s NTP step ==")
+show("t1 (before step)", t1)
+show("t2 (after step)", t2)
+show("t3", t3)
+print("monotonic:", t1 < t2 < t3)
+print("lag between l and real time after the step:", HLC.unpack(t3)[0] - w.t, "ms")
+
+print("\n== 6. what a pure Lamport timestamp loses ==")
+lam, prev_wall = 0, None
+for wall in (BASE, BASE + 300_000, BASE + 300_001):
+    lam += 1
+    gap = 0 if prev_wall is None else wall - prev_wall
+    print(f"lamport={lam} true wall={wall} real gap since previous event={gap} ms")
+    prev_wall = wall
+print("two events 300000 ms apart and two events 1 ms apart both differ by exactly 1 tick")
+print("-> a TTL or 'expire after 60s' rule cannot be evaluated on a Lamport clock; "
+      "on an HLC the l field is directly comparable to wall time.")
+```
+
+This is the actual output of that run — the two listings combined into one file and executed with `python3` (Python 3.14.6), with a fixed fake epoch so the numbers are reproducible:
+
+```text
+== 1. send/receive with 1400 ms of clock skew between the nodes ==
+A write (sender)           packed=116457472026214400 l=1777000000400 c=0
+B write (receiver)         packed=116457472026214401 l=1777000000400 c=1
+HLC says A happened-before B: True
+B's own wall clock is 1400 ms behind A's: 1776999999000 vs 1777000000400
+Wall-clock-only ordering would put B 1400 ms BEFORE A: True   <-- last-write-wins loses B's update
+
+== 2. three writes inside one physical millisecond ==
+event 1                    packed=116457472000000000 l=1777000000000 c=0
+event 2                    packed=116457472000000001 l=1777000000000 c=1
+event 3                    packed=116457472000000002 l=1777000000000 c=2
+strictly increasing: True
+
+== 3. logical counter overflow with a frozen wall clock ==
+at the boundary            packed=116457472000065535 l=1777000000000 c=65535
+one tick later             packed=116457472000065536 l=1777000000001 c=0
+carried into the physical field (l +1 ms, c reset): True
+packed value still monotonic: True
+
+== 4. timestamp payload, 64-node cluster ==
+vector clock: 64 int64 counters = 512 bytes fixed / 631 bytes JSON
+HLC: 8 bytes packed int64 / 18 bytes decimal text
+fixed-width ratio: 64x
+
+== 5. monotonic through a backward 5 s NTP step ==
+t1 (before step)           packed=116457472000000000 l=1777000000000 c=0
+t2 (after step)            packed=116457472000000001 l=1777000000000 c=1
+t3                         packed=116457472000000002 l=1777000000000 c=2
+monotonic: True
+lag between l and real time after the step: 5000 ms
+
+== 6. what a pure Lamport timestamp loses ==
+lamport=1 true wall=1777000000000 real gap since previous event=0 ms
+lamport=2 true wall=1777000300000 real gap since previous event=300000 ms
+lamport=3 true wall=1777000300001 real gap since previous event=1 ms
+two events 300000 ms apart and two events 1 ms apart both differ by exactly 1 tick
+-> a TTL or 'expire after 60s' rule cannot be evaluated on a Lamport clock; on an HLC the l field is directly comparable to wall time.
+```
+
+Read case 1 again, because that is the entire value proposition: `l` did not move at all on the receive — B's successor has the *same* physical component as A and wins the tie only through `c`. Case 3 is the borrow reaching its limit and carrying. Case 5 is what I tell myself before blaming a clock for a bug: the timestamps stayed monotonic while real time went backwards.
+
+## Where real systems use it
+
+<AccordionGroup>
+<Accordion title="Distributed transactions and MVCC">
+
+**Used in distributed databases like CockroachDB and YugabyteDB to safely order transactions and maintain linearizability** ([GeekCulture](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682), [sookocheff](https://sookocheff.com/post/time/hybrid-logical-clocks/)). A transaction's commit timestamp is an HLC, so a snapshot read at a given HLC sees exactly the writes that happened before it. **Multi-Version Concurrency Control (MVCC) benefits too: it helps engines create globally consistent snapshots without forcing nodes to wait out maximum clock uncertainty windows** ([Sergei Turukin](https://sergeiturukin.com/2017-06-26/hybrid-logical-clocks.html), [GeekCulture](https://medium.com/geekculture/all-things-clock-time-and-order-in-distributed-systems-hybrid-logical-clock-in-depth-7c645eb03682)). CockroachDB gets that property by *not* waiting: a reader that hits a newer-but-ambiguous timestamp pushes its own timestamp and retries instead of blocking.
+
+</Accordion>
+<Accordion title="Spanner-style read constraints, without the hardware">
+
+**Unlike Google Spanner's [TrueTime](https://sergeiturukin.com/2017-06-26/hybrid-logical-clocks.html), which relies on atomic clocks and GPS hardware, HLCs work on standard commodity hardware using standard loose NTP synchronization** ([Armironenko](https://medium.com/@armironenko/distributed-systems-logical-time-explained-5f97949f180f), [Hossein Nejatipour](https://hosseinnejati.medium.com/time-and-clocks-in-distributed-systems-physical-vs-logical-clocks-13f702c9857a)). Spanner buys a *bounded uncertainty interval* from hardware and then waits it out at commit; an HLC buys a bounded *offset* from NTP and spends it on read constraints instead. In practice the two read paths I implement on an HLC are: (a) read-your-writes, where the client carries the HLC it observed (a causality token) and the server refuses to serve an older snapshot, and (b) bounded-staleness / safe-time reads, where the server only answers at a timestamp past the low-water mark of all in-flight HLCs. The gap between the two designs is that Spanner's wait is deterministic in `ε` while mine is statistical: I trade a small, retry-shaped latency tail for cheap hardware.
+
+</Accordion>
+<Accordion title="CRDT timestamps">
+
+For a `LWW-Register` or a `G-Counter`-style replicated type, an HLC is the timestamp: it is monotonic per replica, cheap to persist, and — unlike a raw counter — comparable across replicas without carrying `N` entries. What an HLC cannot do is *detect* concurrency, because a scalar cannot express incomparability; a CRDT that has to keep siblings rather than pick a winner needs the causal machinery of [vector clocks or dot versions](/vector-clocks-for-crdt). The pattern I use is HLC for ordering and merge precedence, plus a small causal stamp only on the types where losing a concurrent write is unacceptable.
+
+</Accordion>
+</AccordionGroup>
+
+## The edge cases I design around
+
+:::warning
+**Restart amnesia.** The high-water mark is the invariant, not the wall clock. If a node reboots and starts from `pt` while a peer still holds a larger `l` it handed out before the reboot, the restarted node will stamp successors *before* their causal predecessors. Persist `max(l)` in your WAL or a sidecar file and refuse to start below it.
+:::
+
+:::tip
+**Watch the hot-key borrow.** A single key taking writes faster than your clock ticks is what exhausts `c`. If the carry happens often, your `l` drifts ahead of real time and TTL-style semantics quietly rot even though ordering stays correct. Fix it by widening the counter, by batching writes, or by sharding the key — not by loosening the max-offset budget.
+:::
+
+Other failure modes I have been burned by or plan for: `pt` from a wall clock that steps (use a monotonic source offset from boot, and rebase rarely), NTP convergence after a partition (the skew you tolerate today is the error bound on causality tomorrow), tie-breaking by node id when two nodes share an id after a restore, GC of MVCC versions below the oldest live HLC, and the fact that "physically close" is not "causally ordered" — a reader at time `t` can still miss a write whose `l` was stamped slightly ahead of it.
+
+## Choosing a clock
+
+| Scheme | Bytes per stamp | Causal order | Detects concurrency | Real-time meaning | Hardware |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| Wall clock | 8 | No (inverts under drift) | No | Yes | None |
+| Lamport | 8 | Yes | No | None | None |
+| Vector clock | 8 × `N` nodes | Yes | Yes | None | None |
+| HLC | 8 | Yes | No | Yes, within max offset | Loose NTP |
+| TrueTime (Spanner) | 8 + interval | Yes | No | Yes, with proven bound | Atomic clocks + GPS |
+
+If your system needs conflict *detection*, HLC is not enough and you pay for vector clocks or dots. If it needs ordering plus TTLs plus cheap storage, HLC is the answer, and the eight-byte encoding is the reason it survives contact with a real index.

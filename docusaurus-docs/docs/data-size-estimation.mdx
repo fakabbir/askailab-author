@@ -1,0 +1,112 @@
+---
+title: "Data Size Estimation"
+description: "The unit ladder I use to size any Gen-AI workload, with worked arithmetic for a book corpus, the whole of English Wikipedia, and a billion-review retrieval index."
+---
+Every capacity argument I have lost started with someone quoting a number nobody could trace: "the corpus is about 200 GB". That tells me nothing about tokens, chunks, vectors, RAM, or cost per query. So before I choose an index, a chunk size, or a model, I write down a size estimate that ends in **tokens per query** and **bytes per vector**, because those are the two quantities that actually map to money.
+
+This page is the method, with three corpora worked end to end.
+
+## The unit ladder
+
+Each rung converts to the next by a factor I state explicitly, so anyone can challenge the factor instead of the conclusion.
+
+| Rung | Conversion I use | Where it comes from |
+| :-- | :-- | :-- |
+| 1 character | about 4 characters per word for English prose | typography, not tokenization |
+| 1 word | about 1.3 tokens per English word, plus formatting | [Ofox's context-window token math](https://ofox.ai/blog/what-is-a-context-window-token-limits-by-model-2026/) via [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) |
+| 1 average page | about 500 words, so roughly 650 tokens | paperback layout assumption |
+| 1 average Wikipedia article | roughly **720 to 730 words**, which is about **1,000 tokens** | [Wikipedia: Size in volumes](https://en.wikipedia.org/wiki/Wikipedia:Size_in_volumes), [Elvex context-length comparison](https://www.elvex.com/blog/context-length-comparison-ai-models-2026) |
+| 1 book (novella-length) | about 45,000 words, roughly 60,000 tokens | *The Alchemist*, per [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) |
+| 1 resume | 2 pages, roughly 1,000 words, about **1,300 tokens** | the 1,000-resume case in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) |
+| 1 chunk | 250 to 400 tokens, chosen by me | retrieval granularity, not a property of the data |
+| 1 vector | `dimension × bytes per component` | see the embedding section below |
+
+The 730-word figure is not folklore — I checked it. Special:Statistics showed **5,292,048,832 words across 7,246,168 articles, implying an average of 730.32 words per article** ([Wikipedia: Size in volumes](https://en.wikipedia.org/wiki/Wikipedia:Size_in_volumes)). At 1.3 tokens per word that is 949 tokens, which rounds to the "about 1,000 tokens" number I already used. Two independent methods agreeing within 5% is exactly the confidence I want from an estimate, and the 5% gap is the tokenizer, which is the biggest error source in this whole ladder.
+
+:::note
+The 1.3 tokens per word factor is English-centric and prose-centric. Code, tables, formulas, and non-Latin scripts tokenize far worse — commonly 2 to 4 tokens per "word" for code and multilingual text. If my corpus is mostly code or mostly tables, every downstream number in this page is too optimistic, so I measure a sample with the actual tokenizer rather than scaling a word count.
+:::
+
+## What a window can hold, in articles
+
+Using ~1,000 tokens per average article, the model capacities look like this:
+
+| Model category or example | Context window | Capacity in average Wikipedia articles |
+| :-- | :-- | :-- |
+| Claude Sonnet 5 / GPT series | 1 million | ~1,000 articles |
+| Gemini 3 Pro / Llama 4 Scout | 10 million | ~10,000 articles |
+| Older models (Sonnet 3.5, GPT-4o) | 128K to 200K | ~130 to 200 articles |
+
+In practice, Claude Sonnet 5's 1M window means feeding the model roughly **1,000 average Wikipedia articles** at the same time — an entire niche encyclopedia, or a highly specific multi-volume subject library, in active working memory ([Digirank Claude model comparison](https://digirank.in/claude-models-comparison/)).
+
+Now put that against the edition's size. English Wikipedia holds 7,246,168 articles, so 1,000 articles is **0.014%** of it, and even the 10,000-article ceiling of a 10M window is **0.14%**. That single division is the most useful sizing output on this page: it settles the "long context or retrieval" question for any public-corpus workload before I have designed anything. The window is not competing with the corpus; it is a rounding error against it.
+
+The size distribution matters as much as the mean. [Wikipedia: Article size](https://en.wikipedia.org/wiki/Wikipedia:Article_size) guidelines note that highly detailed "Featured Articles" often run 3,000 to over 7,000 words, roughly 4,000 to 10,000 tokens, so a 1M window holds only about **100 to 250** heavy featured articles rather than 1,000 average ones. People who plan on the mean get surprised by the tail — the same effect surfaces in the reading-time debate in [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer) and in the r/theydidthemath thread on [how long it would take to read every article](https://www.reddit.com/r/theydidthemath/comments/11jvksj/offsite_how_long_would_it_take_to_read_every/). Averages size the storage; percentiles size the failure.
+
+## Sizing a corpus for RAG
+
+For retrieval I need four numbers, in this order.
+
+1. **Tokens in the corpus.** Words times 1.3, or measured directly on a sample.
+2. **Chunks, and therefore vectors.** `tokens ÷ chunk size`, multiplied by an overlap factor. At 300 tokens per chunk with 20% overlap the multiplier is 1.2.
+3. **Vector bytes.** `vectors × dimension × bytes per component`, plus index overhead, times replicas.
+4. **Tokens per query.** `top-k chunks × chunk size + question + instructions`. This is the number that becomes the invoice.
+
+### Index overhead multiplier
+
+From [Scaling a Vector Database](/scalablae-vector-database): at 768 dimensions an fp32 vector is `768 × 4 = 3,072 bytes`, and HNSW with `M=32` adds about `2 × M × 4 = 256` bytes per vector of link storage, which is **1.08x** the raw vectors. Plan on:
+
+| Line item | Multiplier on raw fp32 bytes |
+| :-- | :-- |
+| Raw vectors | 1.00x |
+| HNSW links, 768d, M=32 | 1.08x |
+| Segment metadata, ids, deleted-slot slack | 1.15x |
+| Two read replicas | 2.3x |
+| **Planning figure for RAM** | **about 2.5x raw vector bytes** |
+
+For low-dimensional vectors the graph overhead is a much larger relative multiple — 256 bytes on a 512-byte 128d vector is 1.5x — so the multiplier is dimension-dependent and I never reuse it across projects without recomputing.
+
+## Worked corpus 1: all of English Wikipedia
+
+- Articles: 7,246,168. Words: 5,292,048,832.
+- Tokens at 1.3 per word: **6.88 billion tokens**.
+- Chunks at 300 tokens: 22.93 million; with 20% overlap, **27.5 million vectors**.
+- Vectors at 768d fp32: `27.5M × 3,072 B` = **84.5 GB**. With HNSW links: 91.6 GB. Int8: 21.1 GB. PQ at 96 bytes: 2.6 GB.
+- With two replicas at fp32 plus links: **183.2 GB of RAM**, so roughly 8 shards on 32 GB nodes, or 2 nodes at 128 GB.
+- Re-bill at 1,024 dimensions: 112.7 GB raw and 119.8 GB with links, 239.5 GB replicated. The 33% jump comes entirely from a dimensionality choice made in an embedding-model dropdown.
+- Per query at top-5 chunks of 300 tokens: about **1,550 input tokens** of context, question and instructions included.
+
+The interesting output is that the entire English Wikipedia is an 85 GB vector problem. It is a mid-sized laptop workload, not a distributed system, and I have seen teams build multi-node clusters for corpora four times smaller out of reflex.
+
+## Worked corpus 2: a billion reviews
+
+[User usage at scale](/user-usage) works from a platform with **over 1 billion reviews**, and [User stats](/user-stats) gives 400 to 460 million monthly unique users, roughly 74 to 106 million monthly website visits, and nearly 490 million registered accounts. Size the retrieval layer for it:
+
+- Assumption: average review 120 words. That is my stated assumption, not a source figure, and it is the number to challenge first.
+- Tokens: `1e9 × 120 × 1.3` = **156 billion tokens**. Raw text is about 720 GB at 6 bytes per word.
+- Chunks at 300 tokens: **520 million vectors** — a 500M-scale index, which puts me in the partitioning and hot-shard conversation of [Scaling a Vector Database](/scalablae-vector-database).
+- fp32 at 768d: `520M × 3,072 B` = **1.60 TB**. int8: 0.40 TB. PQ at 96 bytes: **49.9 GB**.
+- Replicated planning figure at fp32 with links: about 4 TB of RAM, versus 0.5 TB quantized. Quantization here is not an optimization, it is the difference between a cluster and an unreasonable invoice.
+- Per query, top-5 chunks plus question and instructions: still about 1,550 input tokens, which is what makes the architecture viable at 5,000 input and 1,500 output tokens per user per day as modelled in [User usage at scale](/user-usage).
+
+:::warning
+The corpus size grew about 23x between the two examples above (6.88 billion tokens to 156 billion) while the query payload barely moved. Corpus size drives infrastructure cost, which is capital and roughly one-off; tokens per query drives operating cost, which recurs on every turn of every session. When I only have attention for one number, I spend it on tokens per query.
+:::
+
+## Worked corpus 3: a thousand resumes
+
+The deliberate counter-example, from [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer): 1,000 resumes at 1,300 tokens each is **1.3 million tokens**, which chunks to about 4,333 vectors and **13.3 MB** of fp32 embeddings at 768d.
+
+13.3 MB is not an infrastructure project. So for this corpus the sizing exercise tells me the index is free and the real decision is per-query cost: 1.3M tokens in context on every turn versus 1,550 tokens of retrieved context. I build RAG here not because the data is too big for the window — at 1.3M tokens it is not, given a 10M window — but because I will ask the question forty times, and the window charges me 1.3M tokens each time.
+
+## Estimation shortcuts I trust
+
+- **Tokens from words:** multiply by 1.3 for English prose, and re-measure for code or multilingual data.
+- **Vectors from corpus:** divide tokens by chunk size, multiply by the overlap factor. Never forget the overlap; it silently changes cost by 20 to 50%.
+- **RAM from vectors:** bytes per vector, times 1.08 for HNSW links at 768d, times replicas, times 1.15 slack.
+- **Daily cost:** tokens per query, times queries per day, times price per million. At 71,220 daily active users and 5,000 in plus 1,500 out per query that is 356.1M input and 106.83M output tokens a day, which is exactly how [User usage at scale](/user-usage) gets to its invoice.
+- **Growth:** multiply by ingestion rate before launch, not after. An index sized to today's corpus is re-indexed at 2 a.m. when it is 14 months old.
+
+:::tip
+Run the ladder on my real corpus before choosing anything else. It decides whether I need [Scaling a Vector Database](/scalablae-vector-database)'s sharding conversation, whether [Why Need RAG if Gemini Can Answer](/why-need-rag-if-gemini-can-answer)'s full-context option is legitimate, and what chunk size I can afford per query in [Complete RAG tutorial](/complete-rag-tutorial). Estimation is five minutes of arithmetic that prevents a quarter of re-architecture; skipping it is how "we'll just put it all in the prompt" survives to production.
+:::

@@ -1,0 +1,107 @@
+---
+title: "Why Need RAG if Gemini Can Answer"
+description: "Long context and world knowledge do not remove the need for retrieval: the private-data, freshness, provenance, cost and latency limits, the counter-case where RAG is genuinely unnecessary, and the rule I use to choose."
+---
+Every few months somebody brings me the same objection in a design review: "Gemini already knows this, and it can take a million tokens in one prompt — why would I build a RAG pipeline?" It is a reasonable question, and the honest answer is that the objection is right about the capability and wrong about the economics. Even though Gemini can answer questions using its massive internal knowledge and a large context window, I still need **retrieval-augmented generation to handle private, changing, or massive datasets efficiently**. These notes were gathered from live AI Mode queries on 17 September 2026, and the numbers below are what I have kept and checked since.
+
+## The thesis, stated
+
+A model with world knowledge and a huge window can *read* my data. That is not the same as being *accountable* for my data. RAG exists to fix four properties that a bigger context window does not fix: membership (is this fact in the model at all), freshness (when did it last change), provenance (which document says so), and marginal cost per query. Long context moves the boundary on capacity and nothing else.
+
+Google's own framing agrees — see the [RAG Engine overview on Google Cloud](https://docs.cloud.google.com/gemini-enterprise-agent-platform/build/rag-engine/rag-overview) — and so does the other direction of the argument, like [Gemini 2.0 Flash: is this the end of RAG as we know it](https://medium.com/@rapidinnovation/gemini-2-0-flash-is-this-the-end-of-rag-as-we-know-it-dbb05fa80dde). The interesting part of this debate is not the slogan; it is where each side is actually correct.
+
+## The limits I keep hitting
+
+### 1. Private and internal data — the membership problem
+
+Gemini does not know my company's private database, internal HR documents, or proprietary codebases unless I feed that data to it ([RAG in 5 minutes with Gemini and your data](https://medium.com/@muni76590/rag-in-5-minutes-build-a-question-answering-app-with-gemini-your-data-de3ac2496910), [RAG Engine overview](https://docs.cloud.google.com/gemini-enterprise-agent-platform/build/rag-engine/rag-overview)). No amount of context window changes this: my corpus was not in the training set, and it is not in the weights. This is the limit with no workaround other than "put the data in front of the model", which is exactly what retrieval is for.
+
+### 2. Freshness — the update-cost problem
+
+If my internal database changes daily, updating a RAG vector store or using a tool like Gemini File Search is much faster than retraining or continuously uploading massive files ([RAG for Gemini](https://www.context-link.ai/blog/rag-for-gemini), [The end of RAG: how Gemini File Search changes everything](https://medium.com/@maliahrajan/the-end-of-rag-how-gemini-file-search-changes-everything-45ddeaeddcfa)). Note that the second link's title is the strongest form of the counter-argument, and it still concedes the point: File Search *is* retrieval, just managed by the vendor. The argument "long context ends RAG" usually turns out to be "I will let the platform run the index for me".
+
+### 3. Provenance and hallucination
+
+RAG forces the model to anchor its answers strictly to the retrieved text chunks, which drastically reduces hallucinations and provides clear source citations. Without retrieved chunks there is nothing to cite, and "trust me" is not an acceptable answer interface in a support bot or a compliance workflow. When I ship an answer with chunk IDs attached, a wrong answer becomes a debuggable event instead of a mystery.
+
+### 4. Cost of long context
+
+Passing millions of tokens of raw documents into every single prompt makes API calls very slow and expensive; RAG retrieves only the exact paragraphs I need, saving time and money ([Why Gemini 1.5 and other large-context models are bullish for RAG](https://medium.com/enterprise-rag/why-gemini-1-5-and-other-large-context-models-are-bullish-for-rag-ce3218930bb4)). Billing is per token *per request*, so a large context is not an upfront cost — it is a recurring tax on every turn of the conversation.
+
+### 5. Latency of long context
+
+This is the limit people underestimate most, so I will take it apart.
+
+## Can it fit is not the same as can it be fast
+
+I ran a concrete experiment with a known small corpus: *The Alchemist* by Paulo Coelho, which is approximately **45,000 words** long ([Readingvine](https://www.readingvine.com/books/the-alchemist/)) — around 160 to 208 pages depending on the edition, with the standard paperback at about 208 pages, and roughly 2.5 to 4 hours of reading time for an average reader. Wikipedia's infobox lists 163 pages for the first English edition ([The Alchemist (novel)](https://en.wikipedia.org/wiki/The_Alchemist_%28novel%29)), a book first published in Brazil in 1993 in hardback, paperback and iTunes formats with an Audible audiobook, and [Reading Length](https://www.readinglength.com/work/W5TT8Je) works out 2 hours 28 minutes at a 250-words-per-minute pace.
+
+I checked that arithmetic rather than trusting it: 45,000 words at 250 wpm is 180 minutes, which is 3 hours, not 2 hours 28 minutes. The 2h28m figure implies a shorter text than 45,000 words. Word counts for novels also vary more than people expect — Mike Shevdon notes exceptions like Stephen King's *The Gunslinger*, the first Dark Tower book, at 55K words ([Word-Count Worries](https://shevdon.com/word-count-worries)). My takeaway: an "average document" number is a planning input with maybe 30% error on it, so I size with a range, not a point estimate. See [Data size estimation](/data-size-estimation) for the ladder I use.
+
+**Can the whole book go in one prompt?** Yes, easily. *The Alchemist* is roughly **60,000 tokens** (about 1.3 tokens per English word plus formatting — [Ofox's context window explainer](https://ofox.ai/blog/what-is-a-context-window-token-limits-by-model-2026/)), and modern models take one million to ten million tokens, so the book fits many times over. I can upload the full text to Gemini, Claude, or GPT and analyse themes, track character development, or query specific plot points all at once — Diogo Cruz documents running exactly that kind of whole-book review workflow in [this narrated-review post](https://www.linkedin.com/posts/diniscruz_narrated-review-of-narrated-review-tool-activity-7495061745296695296-cZqU). That is a fair, honest answer, and it is also true that at 250 wpm a human needs about three hours to do the same thing.
+
+Here is what a whole library looks like at that size:
+
+| Model or tier | Maximum context | Equivalent in copies of *The Alchemist* |
+| :-- | :-- | :-- |
+| Llama 4 Scout (open-weights maximum) | 10 million tokens | ~166 books |
+| Gemini 1.5 Pro (peak hosted limit) | 2 million tokens | ~33 books |
+| Standard frontier flagships (Claude Fable, GPT-5) | 1 million tokens | ~16 books |
+
+Sources for the window sizes: [LLM context window comparison 2026 (Morph)](https://www.morphllm.com/llm-context-window-comparison), [TechCompare token limits by model](https://www.techcompare.app/token-counter/token-limits-by-model), [Vellum's LLM leaderboard](https://www.vellum.ai/llm-leaderboard) — which lists GPT-5.6 Sol at a 1,050,000-token context — [Fastio on Gemini context windows](https://fast.io/resources/gemini-context-window/), which describes current Gemini 3 models such as Gemini 3.1 Pro and Gemini 3.8 Flash as large-input models, TechTarget's "Gemini 1.5 Pro explained: Everything you need to know", which compares Gemini 1.5 Pro against 1.5 Flash, [ELI5: what Gemini 1.5 Pro's 1M window means](https://www.reddit.com/r/explainlikeimfive/comments/1arjccb/eli5_what_does_it_mean_for_google_gemini_15_pro/), and [Gate.ai's longest-context-LLMs survey](https://gate.ai/blog/longest-context-window-llms-in-2026-how-many-tokens-can-gpt-claude-gemini-and-llama-handle). Context windows have expanded by roughly two orders of magnitude since the original transformer architecture, which was a few thousand tokens ([Redis on LLM context windows](https://redis.io/blog/llm-context-windows/)).
+
+Two caveats sit on top of that table. First, the window is a shared budget for **input and output**: if I fill it with book text, the model has no room left for a long, detailed answer ([Datastudios on Gemini context strategies](https://www.datastudios.org/post/google-gemini-context-window-token-limits-model-comparison-and-workflow-strategies-for-late-2025), [Ofox](https://ofox.ai/blog/what-is-a-context-window-token-limits-by-model-2026/)). Second, fitting is not finding. Asking how effectively a model locates one specific sentence hidden inside 160 books is the "lost in the middle" question, and the answer is: worse than people assume, and worse the deeper the target sits.
+
+### The speed question, in two phases
+
+Does it matter in terms of speed whether there is 1M or 10M tokens in context? Yes, it matters immensely. The difference can turn a near-instant answer into a wait lasting minutes ([The 2M token era](https://medium.com/kairi-ai/the-2m-token-era-what-geminis-ultra-long-context-means-for-every-workflow-6d92a90cd81a)), and the reason is that a request has two distinct phases: reading the prompt and writing the answer ([Understanding LLM response latency: input vs output processing](https://medium.com/@gezhouz/understanding-llm-response-latency-a-deep-dive-into-input-vs-output-processing-2d83025b8797)).
+
+**Phase 1 — reading, or time to first token (TTFT).** Before the model writes anything it processes the whole input ([Gemini support thread on high latency with large payloads](https://support.google.com/gemini/thread/454736631/how-to-prevent-high-latency-and-costs-when-sending-large-context-payloads-pdfs-codebases-to-gemini?hl=en), [LLM latency benchmark and optimisation](https://www.kunalganglani.com/blog/llm-latency-benchmark-optimization)):
+
+- At 1M tokens the model chews through roughly 750,000 words. Prefill takes several seconds, usually **10 to 30 seconds** depending on architecture and hardware ([Redis](https://redis.io/blog/llm-context-windows/), [FutureAGI on Gemini 2.5 Pro](https://futureagi.com/blog/google-gemini-2-5-pro-2025/)).
+- At 10M tokens the self-attention cost escalates dramatically — the system compares millions of tokens against each other — and prefilling a 10M-token payload easily takes **2 to 5 minutes** before it begins emitting an answer ([Redis](https://redis.io/blog/llm-context-windows/), [Kairi AI](https://medium.com/kairi-ai/the-2m-token-era-what-geminis-ultra-long-context-means-for-every-workflow-6d92a90cd81a)).
+
+**Phase 2 — writing, or tokens per second.** Every generated token makes the model look back over the whole history held in its **KV cache** ([Atlan on context window limitations](https://atlan.com/know/llm-context-window-limitations/), [Redis](https://redis.io/blog/llm-context-windows/)). At 1M the KV cache is large but manageable and hardware can stream output at a reasonable pace. At 10M it becomes a memory bottleneck: shuttling that much state inside GPU memory slows generation to a noticeably sluggish crawl ([r/LocalLLaMA on long context windows](https://www.reddit.com/r/LocalLLaMA/comments/1lxuu5m/how_does_having_a_very_long_context_window_impact/)). The rule of thumb from the latency deep dive is that output generation is **20 to 400x slower** than input processing, which is why decode length, not prompt length, often dominates the tail.
+
+**The feature that changes this is prompt caching.** Upload 10 million tokens of static data — a library, a codebase — and the first query takes minutes. Keep the same chat window open for a follow-up and the model remembers what it already read, so subsequent responses feel nearly instantaneous because the multi-minute reading phase is skipped ([Gemini support thread](https://support.google.com/gemini/thread/454736631/how-to-prevent-high-latency-and-costs-when-sending-large-context-payloads-pdfs-codebases-to-gemini?hl=en), [Kairi AI](https://medium.com/kairi-ai/the-2m-token-era-what-geminis-ultra-long-context-means-for-every-workflow-6d92a90cd81a)). Prompt caching is a real answer to the latency objection, and it is also an admission: I am caching the reading, not avoiding it. See [Caching LLM Chats to Quickly Answer User Queries Without RAG](/caching-llm-chats-to-quick-answer-user-query-without-rag) for how I make that shared across users.
+
+## The counter-case: when RAG is genuinely not needed
+
+I do not build a vector database reflexively. Retrieval is the wrong tool when:
+
+- **The corpus fits the window and is static.** One book, one contract, one 40-file module. Reading it whole beats indexing it, because chunking can split the exact paragraph where the answer lives.
+- **The task is global, not local.** "Summarise the themes", "compare these five candidates across twenty behavioural metrics", "what changes between these two revisions" — these need everything in active memory at once, and top-k retrieval throws away the majority of the evidence.
+- **The question count is small.** For a one-off analysis, the setup cost of an index never amortises. I paste the documents and pay once.
+- **The vendor already runs the index.** Gemini File Search and managed RAG engines give me retrieval with provenance and freshness handled for me — same machinery, less of my own code.
+- **The latency budget is a human's, not a product's.** A one-shot 2-to-5-minute prefill on 10M tokens is acceptable for an offline report and unacceptable for a user-facing chat turn.
+
+:::tip
+Note how narrow that list is compared to the slogan. Every escape hatch above is a statement about *volume* or *repetition*, not about the model's intelligence. That is the actual lesson: RAG is a cost and freshness architecture, not a capability patch.
+:::
+
+## The decision rule, worked on 1,000 resumes
+
+The question I like best: I have 1,000 resumes — does it matter whether I build RAG or put everything in the context? Yes, it matters immensely. Even though a 10-million-token window *can* hold 1,000 resumes, RAG is vastly superior for this workload. Three pillars decide it: cost, speed, accuracy.
+
+Assume an average resume is 2 pages, roughly 1,000 words or **1,300 tokens**. Then 1,000 resumes is about **1.3 million tokens** of total data.
+
+| Metric | Option A: everything in context | Option B: RAG pipeline |
+| :-- | :-- | :-- |
+| Financial cost | Extremely expensive — every question re-scans 1.3M tokens; a few dozen queries cost hundreds of dollars | Ultra-cheap — pay to convert the resumes to numbers once, then pennies per query |
+| Speed | Slow — 15 to 30 seconds of reading before the first answer | Instant — the top 5 to 10 relevant resumes are fetched in milliseconds |
+| Accuracy | Risk of oversight — "lost in the middle" makes details buried deep in huge blocks easy to miss | Pinpoint precision — only the relevant candidates are in front of the model |
+| Setup effort | Zero — drag, drop, upload | Moderate — I have to run a database that stores and retrieves resumes |
+
+The trap is **per-query billing**, not the total size. Upload 1.3M tokens and ask "who has Python experience?" — I pay for 1.3M tokens. Then ask "out of those, who has worked at Google?" — I pay for another 1.3M. Cost stacks linearly with turns, which is financially unsustainable for day-to-day HR operations. The arithmetic is the same shape as the 0.7M-token cached-payload model in [User usage at scale](/user-usage): repetition is what kills the budget, and a pipeline that re-reads the world on every turn converts a one-time cost into a per-query tax.
+
+So my rule is short enough to put on a whiteboard:
+
+1. **Corpus larger than the window, or traffic repeated across many users** — retrieve. Build the index, keep it fresh, cite chunks.
+2. **Corpus smaller than the window, question global, few repeats** — load it all, cache the prefix, and skip the index.
+3. **Both** — retrieve to decide what goes in the window, then cache that window. This is the answer for most production systems I have built, and it is why `/caching-llm-chats-to-quick-answer-user-query-without-rag` and this page are neighbours rather than rivals.
+
+Applied to the resume case: **use RAG** if I want a searchable talent pool, candidates matched to job descriptions regularly, skills filtering, and near-minimal operating cost. **Use full context** for a one-time, highly complex cross-analysis of a small batch — the final 5 candidates scored across 20 deeply nuanced behavioural metrics, where the model must hold everything simultaneously. If I want the screening system rather than the one-off answer, the pipeline to build is in [Complete RAG tutorial](/complete-rag-tutorial), the retrieval mechanics are in [RAGs](/rags), and the index sizing lives in [Scalable vector database](/scalablae-vector-database).
+
+:::warning
+The failure mode I have caused personally is defaulting to "dump it all in context" because it is demo-able in five minutes. The demo works. The second turn costs the same as the first, the 40th turn costs 40 times as much, and nobody on the call notices until the invoice does.
+:::

@@ -1,0 +1,227 @@
+---
+title: "Interview Experience"
+description: "Notes from a senior backend loop — a FastAPI rate-limiter race, an atomic Redis sliding-window log, a Postgres index regression, and an active-active CRDT editor — with the answers I gave and the ones I'd give now."
+---
+This page used to be a random page: interview notes with four prompts and almost no answers. Every question, snippet, number and note from the original is preserved below; the working doc is [here](https://docs.google.com/document/d/1ddjj9NrnfrTgP06nv_4jNBkMHlMTtQJVhqPIyE8UzG0/edit?tab=t.0). Anything that reads like an answer is mine, and where my notes had a blank I say **my take**.
+
+## Part 1: the in-memory rate limiter that admits too many requests
+
+```python
+request_log = {"USER_1": []}
+
+def rate_limiter(api_key: str = Depends(verify_api_key)):
+    now = datetime.now()
+    window_start = now - timedelta(seconds=60)
+    request_log[api_key] = [t for t in request_log[api_key] if t > window_start]
+    if len(request_log[api_key]) >= 20:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    request_log[api_key].append(now)
+    return api_key
+```
+
+The question: "This is a plain `def` route (not `async def`), so FastAPI runs it in a thread pool. Under real concurrent load from the same API key, users are occasionally getting more than 20 requests through in a window — on a single pod, no scaling involved. Why, exactly, and what's the minimal fix?"
+
+### Why, exactly (my take)
+
+Thread A prunes and sees 19 entries. Thread B prunes and also sees 19, because A hasn't appended. Both evaluate `19 >= 20` as false, both append, and the window holds 21. A plain `def` dependency runs on Starlette's thread pool (anyio, 40 threads by default), so this body really is on several OS threads, and the GIL only makes single bytecode steps atomic — this is a read-modify-write with a *decision* in the middle.
+
+### The minimal fix
+
+One critical section covering the check *and* the append:
+
+```python
+import concurrent.futures
+from itertools import repeat
+import threading
+import time
+
+lock = threading.Lock()
+request_log = {"USER_1": []}
+
+def check_rate_limit(api_key):
+    now = datetime.now()
+    window_start = now - timedelta(seconds=60)
+    request_log[api_key] = [t for t in request_log[api_key] if t > window_start]
+    if len(request_log[api_key]) >= 20:
+        return False
+    request_log[api_key].append(now)   # must sit inside the same lock hold
+    return True
+
+def check_limit(api_key):
+    with lock:
+        return check_rate_limit(api_key)
+
+def rate_limiter(api_key: str = Depends(verify_api_key)):
+    allowed = check_limit(api_key)
+    if allowed:
+        return api_key
+    raise HTTPException(status_code=429, detail="Rate limit exceeded")
+```
+
+What I got wrong in the room: my notes left the append outside the lock, guarding only the read and the count, so the counter never grows and admits everything. Those `concurrent.futures` and `itertools.repeat` imports were my harness for hammering one key from 40 threads to produce request 21 — I should have led with the repro.
+
+### Where the fix still leaks
+
+A `threading.Lock` is per-process, so one pod with `--workers 4` holds four dicts and a real ceiling of 80 per minute. Only the checked key gets pruned, so the dict grows forever. And `datetime.now()` is naive local time — window on `time.monotonic()`. Related: [FastAPI load performance](/fast-api-load-performance).
+
+## Part 2: multi-pod, Redis, sliding-window log
+
+> "Now implement this properly for a multi-pod deployment using Redis, atomically, as a sliding-window log."
+
+Why `GET`-then-`SET` is hopeless, from my notes with `RL=1` (limit of one):
+
+```text
+R1, R2, R3   RL=1
+R3, R1 -> POD 1     R1 GET API_KEY = 0, PASS, 1
+R2 -> POD 2         R2 GET API_KEY = 0
+```
+
+Both pods read zero before either writes, so a limit of one admits two. The network doesn't remove the race; it widens it from microseconds to milliseconds.
+
+### The log
+
+Sorted set per key: score is epoch milliseconds, member is a unique request ID.
+
+```lua
+-- KEYS[1] = rl:{api_key}
+-- ARGV[1] = window in ms (60000), ARGV[2] = limit (20), ARGV[3] = unique request id
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local window = tonumber(ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
+  redis.call('EXPIRE', KEYS[1], math.ceil(window / 1000) + 1)
+  return 0
+end
+redis.call('ZADD', KEYS[1], now, ARGV[3])
+redis.call('EXPIRE', KEYS[1], math.ceil(window / 1000) + 1)
+return 1
+```
+
+Members must stay unique when scores collide: two requests in one millisecond sharing a member deduplicate and undercount. A request ID makes the script idempotent under retry, `TIME` removes cross-pod NTP as a variable, and the prune costs `O(log N + M)` with `N` capped at the limit.
+
+### "Why does this need to run as a Lua script via EVAL instead of separate `ZREMRANGEBYSCORE` / `ZCARD` / `ZADD` calls from your app?"
+
+Three app-side commands are three places for another pod to land in between: pod 1 runs `ZCARD` and sees 19, pod 2 runs `ZADD`, pod 1 then admits request 20. Pipelining is batching, not isolation, and `MULTI`/`EXEC` can't feed a read result into its own later commands — you'd decide on the client, which is the race you came to remove. Lua keeps prune, compare and write on the server with nothing interleaved, and collapses three round trips into one: at 0.4 ms intra-region, ~1.2 ms and a three-times-wider race window, gone for free. Load via `SCRIPT LOAD`, call `EVALSHA` ([Optimizing Redis via Lua script](/optimizing-redia-via-lua-script)), and keep the body short — it blocks the server and invites `BUSY`.
+
+### Failover to a lagging replica
+
+> "Redis fails over to a replica mid-window that's a few hundred milliseconds behind on replication. What happens to your rate limit accuracy right after failover, and how would you bound the damage without adding synchronous replication latency to every request"
+
+Accuracy goes **permissive**: the promoted replica is missing the last few hundred milliseconds of `ZADD`s, so `ZCARD` undercounts and over-admission is bounded by `accepted_rate × lag`.
+
+| Accepted rate for the key | Entries lost at 300 ms lag | Effective limit, rest of window |
+| --- | --- | --- |
+| 0.33 req/s (the spec: 20 per minute) | 0.1 | 20 — invisible |
+| 50 req/s (shared service key) | 15 | up to 35 |
+| 200 req/s (abuse, leaked key) | 60 | up to 80 |
+
+The key most likely being abused is the one whose failover erases the most history. Name the second trap unprompted: under `maxmemory-policy allkeys-lru` the set can be evicted and the count resets to zero, so rate-limit keys want `noeviction`. `WAIT` is the obvious answer and the one the prompt excludes: a replication round trip per request. My takes:
+
+- **Two-level limiter.** In-pod ceiling of `limit / expected_pods` as a floor, Redis for precision: failover degrades you to a bound of `pods × local_ceiling` regardless of lag, and you survive Redis being slow or down.
+- **Replay from a pod-local ring buffer** of accepted `(key, ts, request_id)`, re-`ZADD`ed once a `master_replid` change or Sentinel `+switch-master` flags promotion. Unique members make replay idempotent; the hot path is untouched.
+- **Fail closed briefly on hot keys** at a reduced threshold for one window — spurious 429s instead of a silent budget breach.
+- **Change the promise** to "approximately 20 per minute" and guard the consequence downstream, with diverging per-pod rejection rates as the failover canary.
+
+Capacity: 1M active keys × 20 entries × ~100 bytes is ~2 GB of stored history — a fixed-window counter is two orders of magnitude cheaper if exact sliding behavior isn't required.
+
+## Round 3: the plan that stopped using the index
+
+```text
+EXPLAIN ANALYZE
+SELECT * FROM sessions WHERE user_id = 48213 ORDER BY created_at DESC LIMIT 1;
+
+Seq Scan on sessions  (cost=0.00..184320.00 rows=2000000 width=64) (actual time=0.02..912.4 rows=1 loops=1)
+  Filter: (user_id = 48213)
+  Rows Removed by Filter: 1999999
+
+Planning Time: 0.11 ms
+Execution Time: 912.6 ms
+```
+
+> "A composite index `(user_id, created_at DESC)` exists on this table. The planner is ignoring it and doing a sequential scan over 2 million rows. The client swears 'it used to use the index.' Diagnose, and fix it live — without taking a long lock on a table this size."
+
+The diagnose steps I wrote in the room: check whether the indexing is right; check whether this happens for all the requests; check whether it happens at a given time or load; check deployment health; check whether a separate index on `user_id` helps; make sure the execution is parallel.
+
+### Read the numbers before touching anything
+
+`rows=2000000 width=64` implies `2,000,000 × (64 + 24)` ≈ 176 MB of tuple data, so ~22,500 8 KB pages, and 912.6 ms across those is ~200 MB/s — warm cache. `Rows Removed by Filter: 1999999` for `actual rows=1` means the `LIMIT 1` ran to the end of the table: row order tracks insertion time, not `user_id`, so `LIMIT` on a seq scan becomes a full scan.
+
+The cost doesn't reconcile: at `seq_page_cost = 1.0`, `cpu_tuple_cost = 0.01` and `cpu_operator_cost = 0.0025`, 2M rows contribute ~25,000 of CPU cost, leaving ~159,000 for page reads — about 1.3 GB, roughly 650 bytes per row, not 64. So either `SELECT *` is detoasting wide columns or `relpages` is stale after a bulk load, which is why my first action is `ANALYZE sessions`: a `ShareUpdateExclusiveLock` only.
+
+### Causes, checks, live fixes
+
+| Cause | Check | Fix without a long lock |
+| --- | --- | --- |
+| Stale stats, bad `n_distinct` after a bulk load | `last_autoanalyze`, `reltuples`, `pg_stats` | `ANALYZE`, then `SET STATISTICS 1000` and `ANALYZE` |
+| Index left INVALID by a failed concurrent build | `pg_index.indisvalid` | `REINDEX INDEX CONCURRENTLY`, outside a transaction |
+| Parameter cast to text defeats the btree | column type versus driver bind type | Fix the binding, or add an expression index `CONCURRENTLY` |
+| Reads moved to a replica without the DDL | `EXPLAIN` against each endpoint directly | Roll out the DDL; check pooler pinning |
+| Cost constants, cached generic plan, `NULLS LAST` mismatch | does it track time or load only | Session-level `SET`, `plan_cache_mode`; ASC indexes scan backwards |
+
+My step "check whether a separate index on `user_id` helps" is the cast test: if another index on the same column changes nothing, suspect the type, not the definition. Then `ANALYZE` followed by plain `EXPLAIN` — not `EXPLAIN ANALYZE`, which re-executes the 912 ms scan on a hot path. If the plan doesn't flip, compare estimated against actual rows on the filter node: the direction of that disagreement separates statistics from type casts. Anything genuinely missing gets built with `CREATE INDEX CONCURRENTLY`, `lock_timeout` and `statement_timeout` set.
+
+:::warning
+Never `VACUUM FULL` here: it holds `ACCESS EXCLUSIVE` for the whole rewrite — exactly the long lock the prompt rules out. Plan `fillfactor` and autovacuum instead.
+:::
+
+On "make sure the execution is parallel": `max_parallel_workers_per_gather` splits those 22,500 pages across workers and takes 912 ms to a few hundred — a band-aid while the index path is repaired, since workers multiply per-query CPU on a busy pod. Treating it as the fix is how a plan regression becomes a capacity incident. Background: [Sequential database scan](/sequential-database-scan).
+
+## A1: multi-region design under a compliance constraint (15 min)
+
+> "Design a real-time collaborative document editor — Google-Docs style, 500 concurrent users per document, real-time cursor/presence tracking, correct conflict resolution — that must run active-active across two regions (US-East and EU-West) because of EU data-residency requirements. Users in either region can edit the same document simultaneously. The system must survive a full region outage losing no more than a few seconds of confirmed edits, and must keep working (in a degraded but correct way) if the link between regions is partitioned for up to two minutes."
+
+Push for real depth, not architecture-diagram hand-waving. The push questions, verbatim:
+
+1. "Which CRDT are you using for the text itself (e.g., RGA, Logoot, a sequence CRDT), and walk me through why concurrent inserts from both regions converge to the same final string on both sides. What are the actual mathematical properties (commutativity, associativity, idempotency) your merge function needs, and where would a naive implementation violate one of them?"
+2. "Cross-region latency is ~120ms, intra-region is ~5ms. Does your chosen CRDT give you causal ordering for presence/cursor updates for free, or do you need something on top — vector clocks, hybrid logical clocks? Justify the choice."
+3. "The link between regions drops for 90 seconds. Both regions keep accepting local edits. When it heals, what exactly happens, in order, to bring both replicas back to a converged state — and is there any edit ordering a user could perceive as 'wrong' even though the system is technically correct?"
+
+The trace used to anchor it:
+
+```text
+Current : AB
+User 1 -> EU : ABC
+User 2 -> US : ABD
+
+ABCD
+```
+
+### Which CRDT, and why ABCD (my take)
+
+An RGA-style sequence CRDT with causal insertion references — Yjs is the production-shaped variant — rather than Logoot or LSEQ, for size: fractional-ID schemes attach a multi-level ID per character that grows as concurrent inserts pile up at one position, and with 500 users over months you gossip that on every byte. RGA carries one unique ID plus a tombstone flag per character: constant size, with tombstone GC as the hard part.
+
+Convergence on the trace: both users insert after `B`. EU submits `insert(C, after=B, id=(EU, 7))`, US submits `insert(D, after=B, id=(US, 3))`. Each replica sorts the children of `B` by a *total* order over IDs — `(hlc_timestamp, site_id)` — and sorting a set is deterministic, so both regions put `C` before `D` and both render `ABCD` without speaking.
+
+Where naive code breaks the properties. **Idempotency**: at-least-once gossip plus retries means every op arrives twice, and keying elements by position instead of identity duplicates a character on redelivery. **Commutativity**: `EU then US` must equal `US then EU` — it holds because insertion compares IDs to pick a slot rather than using an index the other op already shifted, and "insert at offset 3" violates it, exactly why Operational Transform needs a transform function and a CRDT doesn't. **Associativity**: eager tombstone GC breaks it. EU deleting `B` while US holds an insert *referenced to* `B` means `(del, then insert)` drops the character but `(insert, then del)` keeps it, so collect an element only once all causal descendants exist on both replicas: TTL plus an anti-entropy sweep, never immediate physical deletion.
+
+### Presence: not free, and not vector clocks
+
+Text convergence gives element order, not "show this user's newest caret." Presence is ephemeral state I deliberately don't merge — last-writer-wins per `(user, document)` — but it needs a timestamp, and vector clocks are the wrong size: a 500-site clock is ~2 KB per message, and a 50 ms presence tick across 500 users is 10,000 messages/s per document, so metadata alone is ~20 MB/s per hot document. A hybrid logical clock (milliseconds, counter, site ID: ~12 bytes) is ~120 KB/s for the same traffic — a factor of ~167 — and total order is what I want, not partial order ([Hybrid Logical Clocks](/hybrid-logical-clocks), [vector clocks for CRDT](/vector-clocks-for-crdt)). Version vectors do earn their place as per-replica state vectors for anti-entropy: "I have ops through `(EU, 14820)`" is O(regions) = 2 entries, not O(users).
+
+Text ops need the same arithmetic: 500 users at ~5 ops/s is 2,500 ops/s, ~150 KB/s of ingest at 60 bytes per op, but naive fan-out is `2,500 × 499` deliveries ≈ 75 MB/s per document — so coalesce into 100 ms ticks (~5:1) and relay per region instead of meshing, which lands at ~15 MB/s intra-region and ~30 KB/s cross-region.
+
+### The 90-second partition, in order (my take)
+
+1. Both regions accept edits locally, appending to a durable journal with a bounded per-document outbox; EU and US diverge legitimately.
+2. On heal, each side exchanges state vectors and computes what the other lacks.
+3. Deltas ship batched per document on a ~100 ms tick, never per op.
+4. The receiver topology-sorts incoming ops by causal dependency and re-sorts each sibling list under the ID comparator; tombstones reconcile and GC stays deferred until both sides report the same frontier.
+5. Carets rebase against the merged sequence; presence is discarded and rewritten.
+6. The authoritative replica re-checkpoints and compacts if the tombstone ratio crossed its threshold.
+
+Perceived as wrong while technically correct: both regions typed inside one word, each locally seeing `hel` then `lo`, and the merge yields `hlelo` — converged, causal, broken to both authors. A caret jumping mid-sentence as a remote insert lands before you. Delete-wins erasing work: US deletes a paragraph, EU rewrites half of it during the partition, and on merge EU's text vanishes — insert-wins would instead resurrect deleted content, so someone loses either way, hence the need for an operation history and a "who won and why" surface. And HLC ordering can place a teammate's text first even though you typed after them, because the tiebreak is `(ms, site)`, not intent.
+
+Two requirements whiteboards dodge. **"Lose no more than a few seconds of confirmed edits" is a definition problem**: ack after local durability plus a gossip enqueue and region-loss equals pipeline depth, so a ~1 s flush cap gives RPO ~1 s and costs only ack latency; acking after the peer region has it adds ~120 ms per keystroke and the editor feels like telnet. I'd expose two levels — applied locally, durable regionally — and flip a document into "confirming" mode when flush lag exceeds budget. **"EU data residency" forbids the naive active-active**: replicating EU content into US-East *is* the violation, so pin by document — EU-subject documents authored, journaled and stored only in EU-West, with US users reaching them through a stateless edge that pays the ~120 ms RTT, tolerable because the CRDT absorbs latency locally. US-subject documents replicate freely, so simultaneous cross-region editing still works; only storage location is constrained.
+
+## What this loop is actually testing
+
+One theme: **the boundary of an atomic operation.** Part 1 asks where the read-modify-write boundary sits inside a process; Part 2 asks you to move it into another machine, hold it there, then say what breaks when that machine changes identity mid-window; Round 3 asks you to read a *decision* — the planner's — rather than code, and remediate inside a lock budget; A1 asks whether "CRDT" is a box on a diagram or a property you can violate on demand. The second theme is quantification: 21 requests rather than "some," 60 lost entries at 200 req/s rather than "a few," 20 MB/s of vector clocks, a 1.3 GB heap implied by a cost figure that disagrees with a 64-byte width. As [What to expect in FDE GenAI roles](/what-to-expect-in-fde-gen-ai-roles) says, the panel grades failure modes and limitations, not narration.
+
+## How to prepare for this shape
+
+- Name the primitive that closes check-then-act in each context: `threading.Lock` in-process, `EVAL` or compare-and-set across the network, a single-writer actor when you'd rather not lock.
+- Bring the repro before anyone asks: `ThreadPoolExecutor` plus `itertools.repeat` hammering one key turns "I think it's a race" into a demonstrable 21st request.
+- Run `EXPLAIN ANALYZE` on a real 2M-row table until comparing estimated against actual rows is reflex, and know which DDL is lock-free (`CREATE INDEX CONCURRENTLY`, `ANALYZE`) versus not (`VACUUM FULL`, plain `REINDEX`).
+- For CRDTs, rehearse the *violation*: a delete plus a concurrent insert breaking associativity, and HLC over vector clocks justified by a bandwidth calculation.
+- Keep a capacity sheet you can recite — bytes per op, latency budgets, inter-region RTTs — from my scratchpads [Data Size Estimation](/data-size-estimation) and [User Usage](/user-usage). Fix your scope too: these prompts skew distributed systems and data, while my [sample resume](/sample-resume) leads with RAG and agents.

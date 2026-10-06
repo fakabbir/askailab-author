@@ -1,0 +1,104 @@
+---
+title: "Sample Resume"
+description: "A Gen-AI and Forward Deployment Engineer resume template in resume shape, followed by commentary that explains every choice using this resume's own lines as the worked examples."
+---
+This page has two parts. The first is the resume itself, kept in resume shape so it can be copied and used. The second is my commentary on why each line is written the way it is, using this resume's own bullets as the examples. Contact details, employer names, and dates are left as placeholders in square brackets because I am not going to invent them — fill them in with your own.
+
+# Part one: the resume
+
+**[Your Name]** — AI Engineer, Agentic AI and Gen-AI platforms
+[City, Country] | [Email] | [Phone] | [LinkedIn] | [GitHub]
+
+## Summary
+
+AI Engineer with experience in architecting production-grade Agentic AI platforms, multi-agent systems, Retrieval-Augmented Generation (RAG) pipelines, and cloud-native AI applications. Experienced in designing scalable LLM platforms using LangGraph, Model Context Protocol (MCP), FastAPI, AWS, Azure, and GCP. Passionate about building reliable AI systems with strong evaluation pipelines, observability, agent memory, and autonomous reasoning.
+
+## Experience
+
+**[Company]** — [Title] | [Start] – [End]
+
+- Architected and delivered an enterprise AI-powered cloud migration platform automating infrastructure discovery, architecture analysis, migration planning, compliance validation, production readiness assessment, and multi-cloud provisioning across AWS, Azure, and GCP, reducing migration planning time from 3 months to 3 weeks while improving delivery efficiency by ~70%.
+- Designed a scalable LangGraph-based multi-agent architecture consisting of Planner, Research, Document Intelligence, Architecture Generation, Infrastructure Assessment, Validation, and Provisioning agents integrated through Model Context Protocol (MCP), enabling standardized tool orchestration, shared context, and autonomous workflow execution.
+- Implemented hybrid agent memory combining session memory, semantic memory, retrieval memory, and conversation history to enable long-running workflows, cross-agent collaboration, and context-aware decision-making across complex migration pipelines.
+
+**[Company or Project]** — [Title] | [Start] – [End]
+
+- Engineered an enterprise knowledge and reasoning platform using Docling, Hybrid Search (BM25 + Dense Retrieval), Qdrant, BGE Embeddings, Reciprocal Rank Fusion (RRF), Cross-Encoder Reranking, metadata filtering, and confidence scoring, improving retrieval precision by ~35% while significantly reducing hallucinations.
+- Built an end-to-end LLM evaluation platform using LangSmith, Ragas, automated regression testing, custom evaluation metrics, human-in-the-loop validation, and continuous quality monitoring to measure retrieval quality, hallucination rate, latency, and agent reliability before production deployment.
+- Developed dynamic prompt optimization and intelligent model routing using structured prompting, few-shot prompting, prompt versioning, context compression, fallback strategies, and workload-aware routing across Gemini 2.5 Pro, Claude Sonnet (AWS Bedrock), and Gemini Flash, reducing inference latency by ~45% and token cost by ~40%.
+- Engineered production-grade AI reliability with prompt injection detection, PII redaction, schema validation, output guardrails, retry strategies, circuit breakers, confidence-based routing, and approval workflows, enabling safe autonomous AI execution in enterprise environments.
+- Built scalable asynchronous FastAPI services deployed through Docker, Terraform, GitHub Actions, AWS ECS/Fargate, and Cloud Run with OpenTelemetry, Prometheus, Grafana, SonarQube, automated CI/CD, smoke testing, and rollback strategies while maintaining zero unplanned production downtime.
+
+## Skills
+
+| Group | Contents |
+| :-- | :-- |
+| AI and LLMs | Agentic AI, LangGraph, LangChain, MCP, Multi-Agent Systems, RAG, Agent Memory, Prompt Engineering, Prompt Optimization, Tool Calling, Function Calling, LangSmith, Ragas, Hugging Face, AWS Bedrock, Vertex AI, Google ADK |
+| Retrieval and search | Qdrant, ChromaDB, Hybrid Search, BM25, BGE Embeddings, Cross-Encoder Reranking, RRF |
+| Languages | Python, JavaScript, TypeScript, Java |
+| Backend | FastAPI, REST APIs, AsyncIO, Pydantic, Redis, Celery |
+| Cloud and DevOps | AWS, Azure, GCP, Docker, Terraform, GitHub Actions, ECS, Cloud Run, Nginx |
+| Observability | OpenTelemetry, Prometheus, Grafana, SonarQube |
+
+## Projects and links
+
+- [Ask AI Labs](/) — capacity, cost, and retrieval write-ups that back up the claims above.
+- [Complete RAG tutorial](/complete-rag-tutorial) — the pipeline in this resume, reproduced end to end.
+
+# Part two: commentary on the choices
+
+I am going to argue with this resume line by line, because the reasoning transfers to your own document even where my exact wording does not.
+
+## The summary is a stack declaration, not a biography
+
+The opening sentence names four deliverable types: Agentic AI platforms, multi-agent systems, RAG pipelines, cloud-native AI applications. Each of those maps to a job-description phrase a recruiter or engineering manager is searching for, and each is a category a technical reviewer can immediately probe. That is the job of a summary: to hand the reader a set of hooks they can pull on, in the order I want to be questioned.
+
+Notice that the second sentence repeats the specific technologies — LangGraph, MCP, FastAPI, AWS, Azure, GCP. Redundancy between the summary and the bullets is deliberate in a resume read twice: once in fifteen seconds by someone screening, once in fifteen minutes by someone who will interview me. The cheap nouns survive both passes; the adjectives survive neither.
+
+The third sentence, "Passionate about building reliable AI systems with strong evaluation pipelines, observability, agent memory, and autonomous reasoning", is the weakest line in the document and the one I would change first. "Passionate about" is unfalsifiable. But look at what it smuggles in: evaluation pipelines, observability, agent memory. Those are the four nouns the rest of the resume spends real bullets on, so the line works as a table of contents even though its framing is soft. My edit would be to delete the passion clause and keep the nouns, since the bullets already prove them.
+
+## Why the biggest win is bullet one, and how it is quantified
+
+The first experience bullet is the strongest thing in the resume because it contains a before-and-after pair I can defend: **reducing migration planning time from 3 months to 3 weeks while improving delivery efficiency by ~70%.**
+
+Three properties make it work. It has a baseline (3 months), so the reader knows what normal was. It has a unit of business value (calendar time), not an engineering vanity metric. And the two figures cross-check: 3 months to 3 weeks is roughly a 75% reduction in elapsed time, and the claimed efficiency gain is ~70%, so the numbers are consistent rather than mutually contradictory — which is the first thing a skeptical reviewer tests. A bullet that says "10x faster and 90% cheaper and 5x more accurate" reads as invented, because compounding superlatives rarely survive arithmetic.
+
+The second half of the same bullet is a scope declaration: discovery, architecture analysis, migration planning, compliance validation, production readiness assessment, and multi-cloud provisioning. Six named workflow stages tell the reader this was a system, not a script, and they set up the multi-agent bullet that follows.
+
+## The agent bullet exists to prove decomposition, not to name-drop LangGraph
+
+"LangGraph-based multi-agent architecture consisting of Planner, Research, Document Intelligence, Architecture Generation, Infrastructure Assessment, Validation, and Provisioning agents integrated through Model Context Protocol (MCP), enabling standardized tool orchestration, shared context, and autonomous workflow execution."
+
+The seven agent names are the payload. Naming the roles shows I decomposed a workflow into stages with different failure characteristics — which is the thing the interview loop actually probes when it asks about agent orchestration patterns and multi-agent system design, and specifically about **ambiguous delegation between agents** and **context or state loss during hand-offs**. A resume that says "built multi-agent systems" invites one question and dies. A resume that lists a Planner, a Validation agent, and a Provisioning agent invites the question I want: how do you stop Provisioning from acting on a plan Validation rejected, and what happens to shared state when the loop restarts.
+
+The MCP mention earns its place because it answers a different question — how tools were standardised across agents rather than hand-coded per agent — and MCP is now a term screeners search for.
+
+## The retrieval bullet is the one I would be grilled on, and it is written to survive it
+
+"Docling, Hybrid Search (BM25 + Dense Retrieval), Qdrant, BGE Embeddings, Reciprocal Rank Fusion (RRF), Cross-Encoder Reranking, metadata filtering, and confidence scoring, improving retrieval precision by ~35% while significantly reducing hallucinations."
+
+This is a complete retrieval stack, in pipeline order: parse (Docling), two independent retrievers (lexical BM25 and dense vectors), a fusion step (RRF), a reranker (cross-encoder), a filter stage (metadata), and a gate (confidence scoring). Reading it left to right tells an experienced reviewer that I know *why* each stage exists — hybrid because neither BM25 nor dense retrieval alone survives the query-document mismatch problem, RRF because the two scorers are not on comparable scales, cross-encoder because bi-encoder ranking is cheap but coarse, confidence scoring because the system needs to know when to abstain.
+
+Now the part I have to be able to say out loud. **Precision by ~35%** is a relative claim, and the interview question is always the same three parts: measured against what baseline, on what evaluation set, and with what metric. Precision at k over a labelled sample of queries is the defensible reading. "Significantly reducing hallucinations" is weaker than the number beside it — groundedness scoring in Ragas would be the honest way to make that concrete, and the very next bullet is the one that names LangSmith and Ragas, which is why the ordering is not accidental.
+
+## Why evaluation and reliability each get their own bullet
+
+Most Gen-AI resumes of this shape lead with the model and end with the deploy. This one spends two of eight bullets on evaluation (LangSmith, Ragas, automated regression testing, custom metrics, human-in-the-loop validation, continuous quality monitoring — measuring retrieval quality, hallucination rate, latency, and agent reliability **before production deployment**) and on reliability (prompt injection detection, PII redaction, schema validation, output guardrails, retry strategies, circuit breakers, confidence-based routing, approval workflows).
+
+I keep them as separate bullets because they are the two areas where FDE and applied-AI loops find the biggest gaps. The teaching and knowledge rounds are explicitly scenario-based on production challenges, debugging, security, and trade-offs, and the guardrail vocabulary above is precisely the list they walk through. A candidate whose resume contains only the happy path gets asked "how do you know it is still good after you change the prompt?" and has nothing to point at. Approval workflows on top of autonomous execution is also the single most credible line for anyone building agents in an enterprise, since it shows I understand that the risky part is not generation but action.
+
+The routing bullet deserves the same attention: workload-aware routing across **Gemini 2.5 Pro, Claude Sonnet on AWS Bedrock, and Gemini Flash**, with prompt versioning, context compression, and fallback strategies, cutting inference latency by **~45%** and token cost by **~40%**. Cost and latency in the same bullet, with a mechanism named for each — routing to a cheaper tier where the task allows, compression reducing prompt tokens, fallbacks bounding the tail. That is a capacity-engineering story, and it is why the final infrastructure bullet (FastAPI, Docker, Terraform, GitHub Actions, ECS/Fargate, Cloud Run, OpenTelemetry, Prometheus, Grafana, SonarQube, smoke testing, rollbacks, **zero unplanned production downtime**) closes the list: the platform claim needs a deploy and observability story or the earlier numbers have no environment to have been measured in.
+
+## What this resume does not say, and what I would add
+
+The gaps are more instructive than the strengths, so I will be blunt about them.
+
+1. **No scale numbers.** Not one corpus size, request rate, or user count appears. For a platform that routes model traffic, the missing line is the one that would make every other number credible: vectors in the index, tokens per query, queries per day. [Data size estimation](/data-size-estimation) is the method for producing those honestly, and [User usage at scale](/user-usage) shows the shape — 71,220 daily active users, 5,000 input and 1,500 output tokens per query, 356.1M input tokens a day. Add a sentence like `[N] documents, [M] vectors at [D] dimensions, [Q] queries/day at [latency] p99` and the retrieval and routing bullets stop being assertions.
+2. **No team context.** "Architected and delivered" a platform of that size alone is either heroic or incomplete. State the team size and my specific surface area, because reviewers assume a solo claim is an inflated one.
+3. **Multi-cloud is a liability as written.** Claiming AWS, Azure, and GCP in one bullet invites the deepest probe I can be given, and I should only keep it if I can discuss what differed between the three — IAM boundaries, networking, and where provisioning actually succeeded. If I cannot, one cloud described well beats three named.
+4. **"Zero unplanned production downtime" needs a window.** Over a quarter it is a strong claim; over a career it is unverifiable. Attach the period.
+5. **No links to artefacts.** For a Gen-AI role, a runnable repo with an evaluation script outperforms any bullet. The [Complete RAG tutorial](/complete-rag-tutorial) is exactly the kind of artefact I would link — including the numbers it actually produced rather than the ones I hoped for.
+
+:::tip
+If I only take one editing rule from this page: every claim about quality needs a measurement, and every claim about scale needs a number. The strongest bullets in the document above all pair a mechanism with a figure — six workflow stages with 3 months to 3 weeks, hybrid retrieval with RRF and a reranker with ~35% precision, routing with ~45% latency and ~40% cost. The weakest bullets pair an adjective with a noun. Rewrite those and the document is done. For how these lines get interrogated in a loop, see [What to Expect in FDE GenAI Roles](/what-to-expect-in-fde-gen-ai-roles), and for the retrieval stack named here, [Scaling a Vector Database](/scalablae-vector-database).
+:::

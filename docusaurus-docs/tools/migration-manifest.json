@@ -1,0 +1,31 @@
+{
+  "Trip @ Scale": [
+    "user-stats",
+    "fast-api-load-performance",
+    "customer-segmentation",
+    "calculating-time-to-run-a-pipleine",
+    "tag-clustering-algorithm",
+    "user-usage",
+    "rags"
+  ],
+  "Senior SDE": [
+    "hybrid-logical-clocks",
+    "vector-clocks-for-crdt",
+    "sequential-database-scan",
+    "optimizing-redia-via-lua-script"
+  ],
+  "Forward Deployment Engineer": [
+    "caching-llm-chats-to-quick-answer-user-query-without-rag",
+    "what-to-expect-in-fde-gen-ai-roles",
+    "sample-resume",
+    "why-need-rag-if-gemini-can-answer",
+    "latest-terms-in-gen-ai-30-sep",
+    "scalablae-vector-database",
+    "case-stude",
+    "data-size-estimation",
+    "complete-rag-tutorial"
+  ],
+  "Interview Experience": [
+    "interivew-data"
+  ]
+}

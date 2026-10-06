@@ -1,0 +1,82 @@
+---
+title: "AskAILab documentation"
+description: "Field notes on capacity estimation, distributed primitives, retrieval and forward-deployed AI systems — written from work I have actually shipped."
+slug: /
+sidebar_label: "Overview"
+hide_title: true
+---
+
+<div className="carbon-hero">
+  <div className="container">
+    <div className="carbon-hero__eyebrow">Engineering notes · measured, not claimed</div>
+    <h1 className="carbon-hero__title">
+      Systems writing, with the <em>arithmetic</em> left in
+    </h1>
+    <p className="carbon-hero__lede">
+      Twenty-one long-form write-ups from work I have shipped: sizing an ML platform from public traffic
+      numbers, logical clocks that survive concurrent merges, retrieval pipelines I ran end to end, and the
+      interview rounds that tested whether I could teach any of it. Each page keeps its real numbers, its
+      failure modes, and the part I would do differently.
+    </p>
+  </div>
+</div>
+
+## The four tracks
+
+<div className="row" style={{marginBottom: "2rem"}}>
+  <div className="col col--6" style={{marginBottom: "1rem"}}>
+    <a className="carbon-card" href="/user-stats">
+      <div className="carbon-card__index">01 · Trip @ Scale</div>
+      <div className="carbon-card__title">Sizing a consumer AI product</div>
+      <p className="carbon-card__body">
+        Traffic-to-capacity math, customer segmentation, tag clustering, prompt-cache economics and the RAG
+        architecture that ties them together — all anchored on Tripadvisor's public numbers.
+      </p>
+      <span className="carbon-card__count">7 articles</span>
+    </a>
+  </div>
+  <div className="col col--6" style={{marginBottom: "1rem"}}>
+    <a className="carbon-card" href="/hybrid-logical-clocks">
+      <div className="carbon-card__index">02 · Senior SDE</div>
+      <div className="carbon-card__title">Distributed primitives, in the weeds</div>
+      <p className="carbon-card__body">
+        Hybrid and vector clocks for CRDT merges, what a Postgres sequential scan actually costs, and
+        shipping rate limiting to Redis as a Lua script.
+      </p>
+      <span className="carbon-card__count">4 articles</span>
+    </a>
+  </div>
+  <div className="col col--6" style={{marginBottom: "1rem"}}>
+    <a className="carbon-card" href="/complete-rag-tutorial">
+      <div className="carbon-card__index">03 · Forward Deployment Engineer</div>
+      <div className="carbon-card__title">Shipping retrieval for customers</div>
+      <p className="carbon-card__body">
+        A runnable stdlib-only RAG pipeline, vector-database capacity planning, data-size estimation, the
+        FDE role itself, and a resume built for it.
+      </p>
+      <span className="carbon-card__count">9 articles</span>
+    </a>
+  </div>
+  <div className="col col--6" style={{marginBottom: "1rem"}}>
+    <a className="carbon-card" href="/interivew-data">
+      <div className="carbon-card__index">04 · Interview Experience</div>
+      <div className="carbon-card__title">What the rounds actually asked</div>
+      <p className="carbon-card__body">
+        A transcript-level account of applied-AI interview loops, the questions that separated candidates,
+        and how I would run the same round.
+      </p>
+      <span className="carbon-card__count">1 article</span>
+    </a>
+  </div>
+</div>
+
+## How to read these
+
+Every article is first-person and self-contained: I state the constraint I was working under, do the
+arithmetic in the open, then list the failure modes I design against. Where I ran code, I pasted its real
+output — including the runs that looked bad. Where a number is an estimate derived from public data rather
+than a disclosed figure, I say so at the point of use.
+
+Start with [User Stats](/user-stats) if you want the estimation discipline, [Complete RAG
+Tutorial](/complete-rag-tutorial) if you want something to run in the next five minutes, or
+[Vector Clocks for CRDT](/vector-clocks-for-crdt) if you want the deepest rabbit hole.

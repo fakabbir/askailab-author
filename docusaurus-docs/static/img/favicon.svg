@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- AskAILab favicon: a DELIBERATELY simplified form of the app mark.
+       The full mark is a stroked flask holding a question mark
+       (src/components/Mark.jsx). Rendered at 16px in a browser tab both the
+       outline and the question mark break down - tested, a mark that small
+       fills its own counter and reads as a blob - so the favicon is the solid
+       flask alone. The flask is the distinctive half: a question mark on its
+       own would be generic, a flask is not. -->
+  <rect width="24" height="24" fill="#0f62fe"/>
+  <path fill="#ffffff" d="M8.6 2.2h6.8a1.1 1.1 0 0 1 0 2.2h-0.4v4.4l5.6 10.1a1.7 1.7 0 0 1-1.5 2.6H5.9a1.7 1.7 0 0 1-1.5-2.6L10 8.8V4.4H9.6a1.1 1.1 0 0 1 0-2.2Z"/>
+</svg>
